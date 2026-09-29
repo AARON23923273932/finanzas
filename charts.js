@@ -16,7 +16,8 @@ function niceScale(lo, hi, n = 4) {
   lo = Math.min(0, lo); hi = Math.max(0, hi);
   if (hi - lo <= 0) hi = lo + 10000;
   const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
-  const step = [1, 2, 2.5, 5, 10].map(k => k * mag).find(s => s >= raw);
+  const step = [1, 2, 2.5, 5, 10].map(k => k * mag).filter(s => s >= 100 && s % 100 === 0).find(s => s >= raw)
+    || Math.max(100, Math.ceil(raw / 100) * 100);
   const a = Math.floor(lo / step) * step, b = Math.ceil(hi / step) * step;
   const ticks = [];
   for (let v = a; v <= b + step / 1000; v += step) ticks.push(Math.round(v));
@@ -59,9 +60,13 @@ function placeTip(wrap, tip, x) {
 function bindScrub(svg, n, indexAt, show, hide) {
   let cur = -1;
   const go = i => { cur = Math.max(0, Math.min(n - 1, i)); show(cur); };
+  const off = () => { hide(); cur = -1; };
+  svg.closest('.chart')._hide = off; // tocar fuera del gráfico lo cierra (ver listener global abajo)
   svg.addEventListener('pointerdown', e => go(indexAt(e)));
-  svg.addEventListener('pointermove', e => go(indexAt(e)));
-  svg.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') { hide(); cur = -1; } });
+  svg.addEventListener('pointermove', e => { if (e.pointerType === 'mouse' || e.buttons) go(indexAt(e)); });
+  // En iPhone, si el gesto resulta ser scroll vertical, WebKit cancela el puntero: se quita el cursor
+  svg.addEventListener('pointercancel', off);
+  svg.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') off(); });
   svg.addEventListener('focus', () => go(cur < 0 ? n - 1 : cur));
   svg.addEventListener('blur', () => { hide(); cur = -1; });
   svg.addEventListener('keydown', e => {
@@ -104,7 +109,11 @@ function drawLine(wrap, spec) {
   // Etiqueta al final de cada línea, solo si no chocan entre sí
   const clash = ends.some((a, i) => ends.some((b, j) => i < j && Math.abs(a.y - b.y) < 16));
   if (!clash && spec.endLabels !== false) {
-    g += ends.map(e => `<text class="lbl" x="${x(e.i) - 6}" y="${e.y - 9}" text-anchor="end">${esc(money(e.s.values[e.i]).replace(/\.\d\d$/, ''))}</text>`).join('');
+    g += ends.map(e => {
+      const txt = money(e.s.values[e.i]).replace(/\.\d\d$/, ''), w = txt.length * 7;
+      const left = x(e.i) - 6 - w < L + 4; // a principio de mes la línea termina pegada al eje
+      return `<text class="lbl" x="${left ? x(e.i) + 8 : x(e.i) - 6}" y="${e.y - 9}" text-anchor="${left ? 'start' : 'end'}">${esc(txt)}</text>`;
+    }).join('');
   }
   g += `<line class="xh" x1="0" x2="0" y1="${T}" y2="${T + ph}" visibility="hidden"/>`;
   g += spec.series.map((s, k) => `<circle class="hd dot f-${s.cls}" data-k="${k}" r="4" visibility="hidden"/>`).join('');
@@ -172,12 +181,26 @@ function dataStart() {
   return dates.sort()[0];
 }
 
-// Lo que tienes y lo que debes al cierre de un día
+// Lo que tienes y lo que debes al cierre de un día (sin día: con todo lo registrado, como Inicio)
 function positionAt(d, all) {
-  const b = balances(d, all);
+  const b = balances(d || undefined, all);
+  if (d) {
+    // Antes de configurar una tarjeta, su foto de partida ya incluía lo registrado entre ese día y la configuración
+    S.accounts.forEach(a => {
+      if (!a.setupAt || d >= isoDate(new Date(a.setupAt))) return;
+      for (const t of S.tx) {
+        if (counts(a.id, t) || t.date <= d || t.date > today()) continue;
+        let eff = 0;
+        if (t.accountId === a.id) eff += t.type === 'ingreso' ? t.amount : -t.amount;
+        if (t.type === 'transferencia' && t.toAccountId === a.id) eff += t.amount;
+        b[a.id] = (b[a.id] || 0) - eff;
+      }
+    });
+  }
   let tienes = 0, debes = 0;
   S.accounts.forEach(a => { const v = b[a.id] || 0; if (a.type === 'credito') debes += Math.max(0, -v); else tienes += v; });
-  S.debts.forEach(x => { debes += debtRemaining(x, d); });
+  // Una deuda cuenta desde que existe (las anteriores a esta versión no tienen fecha: siempre cuentan)
+  S.debts.forEach(x => { if (!d || !x.since || x.since <= d) debes += debtRemaining(x, d || undefined); });
   return { tienes, debes };
 }
 
@@ -200,6 +223,9 @@ function upcomingPayments() {
   };
   S.accounts.filter(isCardReady).forEach(c => cardInfo(c).statements.forEach(s => { if (s.left > 0) put(s.due, c.name, s.left); }));
   S.debts.forEach(d => { const r = debtRemaining(d); if (!r) return; if (d.due) put(d.due, d.name, r); else undated.push({ name: d.name, amt: r }); });
+  const b = balances();
+  S.accounts.filter(a => a.type === 'credito' && !isCardReady(a) && (b[a.id] || 0) < 0)
+    .forEach(a => undated.push({ name: `${a.name} (sin fechas de cierre y pago)`, amt: -b[a.id] }));
   return { months, bins, later, undated };
 }
 
@@ -213,17 +239,19 @@ function viewGraficos() {
   CHARTS = {};
 
   // Fotos del momento
-  const now = positionAt(t0, all), neto = now.tienes - now.debes;
+  const now = positionAt(null, all), neto = now.tienes - now.debes;
   const cur = cumulativeSpend(mk, all).slice(0, day), prev = cumulativeSpend(pk, all);
-  const spentNow = cur[day - 1] || 0, spentPrevSameDay = prev[Math.min(day, prev.length) - 1] || 0;
+  const spentNow = summary(mk).exp, spentPrevSameDay = prev[Math.min(day, prev.length) - 1] || 0;
 
   // Historial (lo que filtra el rango)
   const rangeStart = shiftMonth(mk, -(R - 1)) + '-01';
   const start = dataStart() > rangeStart ? dataStart() : rangeStart;
-  const days = [];
+  // El primer punto es el cierre del día ANTERIOR al rango: así el gráfico y la variación incluyen lo del primer día
+  const dayBefore = isoDate(new Date(parseDate(start).getTime() - 864e5));
+  const days = [dayBefore];
   for (let d = parseDate(start); isoDate(d) <= t0; d.setDate(d.getDate() + 1)) days.push(isoDate(d));
   const pos = days.map(d => positionAt(d, all));
-  const netDelta = pos.length > 1 ? neto - (pos[0].tienes - pos[0].debes) : null;
+  const netDelta = days.length > 2 ? neto - (pos[0].tienes - pos[0].debes) : null;
 
   // Ritmo de gasto: este mes contra el pasado, día por día
   const nDays = Math.max(daysIn(mk), daysIn(pk));
@@ -256,11 +284,11 @@ function viewGraficos() {
       { name: 'Ingresos', cls: 's1', values: flows.map(f => f.inc) },
       { name: 'Gastos', cls: 's2', values: flows.map(f => f.exp) },
     ],
-    tipExtra: i => [{ value: money(flows[i].inc - flows[i].exp), name: 'te quedó' }],
+    tipExtra: i => (flows[i].debtPay ? [{ value: money(flows[i].debtPay), name: 'pagaste de deudas' }] : []).concat([{ value: money(flows[i].net), name: 'te quedó' }]),
     aria: `Ingresos y gastos por mes: ${flowMonths.map((m, i) => `${monthName(m)} entró ${money(flows[i].inc)} y salió ${money(flows[i].exp)}`).join('; ')}.`,
   };
 
-  if (days.length > 1) {
+  if (days.length > 2) {
     CHARTS.worth = {
       type: 'line', labels: days, xTitle: 'Fecha',
       xFmt: d => fmtShort(d), tipTitle: d => dayLabel(d),
@@ -269,12 +297,12 @@ function viewGraficos() {
         { name: 'Debes', cls: 's2', values: pos.map(p => p.debes) },
       ],
       tipExtra: i => [{ value: money(pos[i].tienes - pos[i].debes), name: 'neto' }],
-      aria: `Desde el ${fmtShort(days[0])}: tienes pasó de ${money(pos[0].tienes)} a ${money(now.tienes)} y debes de ${money(pos[0].debes)} a ${money(now.debes)}.`,
+      aria: `Desde el cierre del ${fmtShort(days[0])}: tienes pasó de ${money(pos[0].tienes)} a ${money(now.tienes)} y debes de ${money(pos[0].debes)} a ${money(now.debes)}.`,
     };
   }
 
   const byCat = {};
-  all.forEach(t => { if (t.type === 'gasto' && t.date >= rangeStart && t.date <= t0) byCat[t.categoryId] = (byCat[t.categoryId] || 0) + t.amount; });
+  all.forEach(t => { if (t.type === 'gasto' && t.date >= rangeStart) byCat[t.categoryId] = (byCat[t.categoryId] || 0) + t.amount; });
   let cats = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
   if (cats.length > 7) cats = cats.slice(0, 6).concat([['__otras', cats.slice(6).reduce((a, c) => a + c[1], 0)]]);
   const catTotal = cats.reduce((a, c) => a + c[1], 0), catMax = cats[0]?.[1] || 1;
@@ -291,7 +319,7 @@ function viewGraficos() {
   <div class="grid2">
     <div class="card stat"><div class="label">Patrimonio neto</div>
       <div class="value ${neto < 0 ? 'gasto' : ''}">${money(neto)}</div>
-      <div class="small muted" style="margin-top:4px">${netDelta === null ? 'Lo que tienes menos lo que debes' : `${deltaTxt(netDelta, true)} desde el ${fmtShort(days[0])}`}</div></div>
+      <div class="small muted" style="margin-top:4px">${netDelta === null ? 'Lo que tienes menos lo que debes' : `${deltaTxt(netDelta, true)} desde el ${fmtShort(start)}`}</div></div>
     <div class="card stat"><div class="label">Gastado este mes</div>
       <div class="value">${money(spentNow)}</div>
       <div class="small muted" style="margin-top:4px">${deltaTxt(spentNow - spentPrevSameDay, false)} vs ${monthName(pk).toLowerCase()} al día ${day}</div></div>
@@ -318,7 +346,7 @@ function viewGraficos() {
 
   <h2>En qué se fue</h2>
   <div class="card">
-    ${cats.length ? cats.map(([id, v]) => `<div class="catrow"><span>${id === '__otras' ? '⋯' : cat(id)?.icon || '•'}</span><span>${esc(id === '__otras' ? 'Otras categorías' : cat(id)?.name || 'Sin categoría')}</span><span class="num">${money(v)} <span class="muted small">${Math.round((v / catTotal) * 100)}%</span></span><div class="bar"><i style="width:${(v / catMax) * 100}%;background:var(--s1)"></i></div></div>`).join('') : empty('Sin gastos en este periodo')}
+    ${cats.length ? cats.map(([id, v]) => `<div class="catrow"><span>${esc(id === '__otras' ? '⋯' : cat(id)?.icon || '•')}</span><span>${esc(id === '__otras' ? 'Otras categorías' : cat(id)?.name || 'Sin categoría')}</span><span class="num">${money(v)} <span class="muted small">${Math.round((v / catTotal) * 100)}%</span></span><div class="bar"><i style="width:${(v / catMax) * 100}%;background:var(--s1)"></i></div></div>`).join('') : empty('Sin gastos en este periodo')}
   </div>
   `;
 }
@@ -332,6 +360,11 @@ function mountCharts() {
     if (open) el.querySelector('details.tbl').open = true;
   });
 }
+
+document.addEventListener('pointerdown', e => {
+  $$('.chart').forEach(ch => { if (ch._hide && !ch.contains(e.target)) ch._hide(); });
+});
+window.addEventListener('scroll', () => { $$('.chart').forEach(ch => ch._hide && ch._hide()); }, { passive: true });
 
 document.addEventListener('click', e => {
   const b = e.target.closest('[data-range]');

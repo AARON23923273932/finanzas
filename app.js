@@ -82,26 +82,95 @@ function defaults() {
     debts: [],
     tx: [],
     rules: {},
-    settings: { savingGoalPct: 20, defaultAccount: 'yape', lastBackup: null },
+    settings: { savingGoalPct: 20, defaultAccount: 'yape', lastBackup: null, catsSeen: DEFAULT_CATS.map(c => c.id) },
   };
 }
 
+// Completa campo por campo lo que falte o venga con otro tipo, en vez de descartar todo
+function normalizeState(s) {
+  if (!s || typeof s !== 'object' || !Array.isArray(s.tx)) throw new Error('No parece un respaldo de esta app');
+  const d = defaults();
+  const arr = (v, def) => (Array.isArray(v) ? v : def);
+  const obj = v => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+  const out = { ...d, ...s };
+  out.accounts = arr(s.accounts, d.accounts);
+  out.categories = arr(s.categories, d.categories);
+  out.debts = arr(s.debts, []);
+  // TEA 0 en una tarjeta = no configurada (así la guardaba la primera versión)
+  out.accounts.forEach(a => {
+    if (!a || a.type !== 'credito' || a.tea !== 0) return;
+    a.tea = null;
+    // En la primera versión «0» significaba «sin configurar» (también en sus compras); «sin intereses» ahora se marca aparte
+    (Array.isArray(s.tx) ? s.tx : []).forEach(t => { if (t && t.accountId === a.id && t.cuotas > 1 && t.tea === 0 && !t.sinInteres) t.tea = null; });
+  });
+  out.rules = obj(s.rules);
+  const rs = obj(s.settings);
+  const goal = Number(rs.savingGoalPct);
+  out.settings = {
+    savingGoalPct: Number.isFinite(goal) && goal >= 1 && goal <= 100 ? Math.round(goal) : d.settings.savingGoalPct,
+    defaultAccount: typeof rs.defaultAccount === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(rs.defaultAccount) ? rs.defaultAccount : d.settings.defaultAccount,
+    lastBackup: typeof rs.lastBackup === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(rs.lastBackup) ? rs.lastBackup : null,
+  };
+  // Categorías nuevas de versiones posteriores, sin resucitar las que el usuario borró.
+  // catsSeen se toma del dato guardado: si no existe, lo visto son las categorías que ya tiene
+  const seen = new Set(Array.isArray(rs.catsSeen) ? rs.catsSeen.filter(x => typeof x === 'string') : out.categories.map(c => c && c.id));
+  for (const c of d.categories) {
+    if (seen.has(c.id)) continue;
+    const at = c.kind === 'gasto' ? out.categories.findIndex(x => x.kind === 'ingreso') : -1;
+    if (at >= 0) out.categories.splice(at, 0, { ...c }); else out.categories.push({ ...c });
+    seen.add(c.id);
+  }
+  out.settings.catsSeen = [...seen];
+  return out;
+}
+
+let loadError = null, corruptRaw = null, corruptStored = false, corruptExported = false, corruptPending = false;
+// Se puede guardar encima solo si la copia ilegible quedó a salvo (en su clave o ya exportada)
+const corruptSafe = () => corruptStored || corruptExported;
 function load() {
-  try {
-    const s = JSON.parse(localStorage.getItem(KEY));
-    if (s && Array.isArray(s.tx)) {
-      const d = defaults();
-      // categorías nuevas de versiones posteriores
-      for (const c of d.categories) if (!s.categories.some(x => x.id === c.id)) s.categories.splice(s.categories.length - 3, 0, c);
-      return { ...d, ...s, settings: { ...d.settings, ...s.settings } };
-    }
-  } catch (e) { /* datos corruptos: arranca limpio */ }
-  return defaults();
+  let raw = null;
+  try { raw = localStorage.getItem(KEY); } catch (e) { loadError = e.message; }
+  // Una copia ilegible de otra sesión sigue guardada: se ofrece exportarla o borrarla
+  try { corruptPending = !!localStorage.getItem(KEY + '.corrupto'); } catch (e) { corruptPending = false; }
+  if (!raw) return defaults();
+  try { return normalizeState(JSON.parse(raw)); }
+  catch (e) {
+    // Nunca pisar en silencio: se guarda una copia de lo que no se pudo leer
+    corruptRaw = raw;
+    try { localStorage.setItem(KEY + '.corrupto', raw); corruptStored = true; } catch (_) { corruptStored = false; }
+    loadError = e.message || String(e);
+    return defaults();
+  }
 }
 let S = load();
+let saveFailed = false;
+// Copia de lo último que quedó bien (lo leído al abrir o el último guardado): a eso se vuelve si no se puede guardar
+let lastGood = JSON.stringify(S);
+const revert = () => { S = normalizeState(JSON.parse(lastGood)); };
+function showAlert(html) {
+  const el = $('#alert'); el.innerHTML = html; el.hidden = false;
+  document.documentElement.style.setProperty('--alert-h', `${el.offsetHeight + 16}px`);
+}
+function hideAlert() { $('#alert').hidden = true; document.documentElement.style.setProperty('--alert-h', '0px'); }
 function save() {
-  try { localStorage.setItem(KEY, JSON.stringify(S)); }
-  catch (e) { toast('No se pudo guardar: ' + e.message); }
+  if (corruptRaw && !corruptSafe()) {
+    revert();
+    showAlert(`<span>Antes de registrar nada, exporta la copia de tus datos que no pude leer.</span><button data-alert="export-corrupt">Exportar copia</button><button data-alert="close" aria-label="Cerrar">✕</button>`);
+    return false;
+  }
+  try {
+    const json = JSON.stringify(S);
+    localStorage.setItem(KEY, json);
+    lastGood = json;
+    if (saveFailed) { saveFailed = false; hideAlert(); }
+    return true;
+  } catch (e) {
+    // La pantalla nunca muestra algo que se perdería al cerrar la app
+    saveFailed = true;
+    revert();
+    showAlert(`<span>⚠️ No se pudo guardar: el almacenamiento está lleno. El último cambio no quedó.</span><button data-alert="export">Exportar respaldo</button><button data-alert="close" aria-label="Cerrar">✕</button>`);
+    return false;
+  }
 }
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
@@ -139,7 +208,36 @@ function findAccounts(n) {
   kept.sort((x, y) => x.start - y.start);
   const ids = [];
   for (const h of kept) if (!ids.includes(h.id)) ids.push(h.id);
-  return { ids, words: kept.map(h => h.al) };
+  // «a/al/hacia» marca destino, «de/del/desde» origen y «con/por/en» el medio («en efectivo»)
+  const ARTICLES = new Set(['el', 'la', 'los', 'las', 'mi', 'mis', 'tu', 'su']);
+  const roled = kept.map(h => {
+    const before = n.slice(0, h.start).trim().split(' ').filter(Boolean);
+    while (before.length && ARTICLES.has(before[before.length - 1])) before.pop();
+    const prev = before[before.length - 1];
+    const role = ['a', 'al', 'hacia'].includes(prev) ? 'to' : ['de', 'del', 'desde'].includes(prev) ? 'from' : ['con', 'por', 'en'].includes(prev) ? 'via' : null;
+    return { id: h.id, role, start: h.start, end: h.end, al: h.al };
+  });
+  // «mi cuenta de ahorros», «la tarjeta de la cmr»: una palabra genérica + «de» + cuenta es esa cuenta.
+  // Dos cuentas con nombre propio («la cmr del bcp», «a yape del bcp») nunca se funden: «de» marca el origen.
+  // «cuenta/tarjeta/banco de <persona>» es de otra persona: no es una cuenta tuya.
+  // «(mi) cuenta de ahorros» es la cuenta Ahorros. «tarjeta del bcp» o «banco de crédito» se quedan como dos cuentas.
+  const GENERIC = new Set(['cuenta', 'tarjeta', 'banco']);
+  const deThen = s => /^(de|del)( (la|el|mi|mis|los|las|su|sus))?$/.test(s.trim());
+  const hitsFinal = [];
+  for (let i = 0; i < roled.length; i++) {
+    const h = roled[i], next = roled[i + 1];
+    if (GENERIC.has(h.al)) {
+      const after = n.slice(h.end).trim();
+      const ofSomething = /^(de|del)\s/.test(after);
+      const ofAccount = next && deThen(n.slice(h.end, next.start));
+      if (ofSomething && !ofAccount) continue; // «la cuenta de mi mamá», «la tarjeta de juan»
+      if (ofAccount && h.al === 'cuenta') { hitsFinal.push({ ...next, role: h.role }); i++; continue; } // «mi cuenta de ahorros»
+    }
+    hitsFinal.push(h);
+  }
+  const ids2 = [];
+  for (const h of hitsFinal) if (!ids2.includes(h.id)) ids2.push(h.id);
+  return { ids: ids2, words: kept.map(h => h.al), hits: hitsFinal.map(h => ({ id: h.id, role: h.role })) };
 }
 
 function findCategory(tokens, kind) {
@@ -189,8 +287,13 @@ function parse(raw) {
   if (!text) return null;
   // «12 cuotas», «en 6 cuotas», «sin intereses» se leen aparte para no confundirlos con el monto
   let cuotas = 1, sinInteres = false;
-  const mc = text.match(/(?:\b(?:en|a)\s+)?(\d{1,2})\s*cuotas?\b/i);
-  if (mc) { cuotas = Math.max(1, Math.min(60, Number(mc[1]))); text = text.replace(mc[0], ' '); }
+  // «en/a 6 cuota(s)» o «12 cuotas» con el número suelto (sin dígitos pegados antes: «250 cuota» no son 50 cuotas)
+  let mc = text.match(/\b(?:en|a)\s+(\d{1,2})\s*cuotas?\b/i), cuotaTxt = mc && mc[0];
+  if (!mc) {
+    const m2 = text.match(/(^|[^\d.,])(\d{1,2})\s*cuotas\b/i);
+    if (m2) { mc = [m2[0], m2[2]]; cuotaTxt = m2[0].slice(m2[1].length); }
+  }
+  if (mc) { cuotas = Math.max(1, Math.min(60, Number(mc[1]))); text = text.replace(cuotaTxt, ' '); }
   const ms = text.match(/sin\s+inter[eé]s(?:es)?/i);
   if (ms) { sinInteres = true; text = text.replace(ms[0], ' '); }
   text = text.replace(/\s+/g, ' ').trim();
@@ -225,6 +328,34 @@ function parse(raw) {
   const savings = S.accounts.find(a => a.type === 'ahorro');
   const cash = S.accounts.find(a => a.type === 'efectivo');
   const debtHit = S.debts.find(d => norm(d.name).split(/\s+/).some(w => w.length >= 3 && !STOP.has(w) && all.includes(w)));
+  const roleOf = id => accs.hits.find(h => h.id === id)?.role;
+  const isRetire = /(^|\s)(retire|retiro)(\s|$)/.test(n);
+  const isDeposit = /(^|\s)deposite(\s|$)/.test(n);
+  // «le/les …» o «a <alguien que no es una cuenta>»: la plata va a otra persona
+  const toPerson = /(^|\s)les?\s/.test(n) || [...n.matchAll(/(?:^|\s)(?:a|al)\s+(?:(?:mi|mis|su|sus|la|el|los|las)\s+)?([a-zñ]+)/g)]
+    .some(m => !accWordSet.has(m[1]) && !['la', 'el', 'los', 'las'].includes(m[1]));
+  // Origen y destino de una transferencia entre TUS cuentas; null si la plata va a otra persona
+  const planTransfer = () => {
+    const hs = accs.hits;
+    const to = hs.find(h => h.role === 'to')?.id;
+    const from = hs.find(h => h.role === 'from')?.id || hs.find(h => h.role === 'via' && h.id !== to)?.id;
+    if (accs.ids.length >= 2) {
+      // Depositar es sacar del efectivo; retirar es meter al efectivo. Se resuelve antes que las preposiciones
+      const cashHit = accs.ids.find(id => acc(id).type === 'efectivo');
+      if (isDeposit && cashHit) return { from: cashHit, to: to && to !== cashHit ? to : accs.ids.find(id => id !== cashHit) };
+      if (isRetire && cashHit) return { from: from && from !== cashHit ? from : accs.ids.find(id => id !== cashHit), to: cashHit };
+      let f = from || accs.ids.find(id => id !== to), t = to || accs.ids.find(id => id !== f);
+      if (!f || !t || f === t) { f = accs.ids[0]; t = accs.ids[1]; }
+      return { from: f, to: t };
+    }
+    const only = accs.ids[0], role = roleOf(only);
+    if (toPerson && !isRetire) return null;
+    if (isRetire) return { from: only && acc(only).type !== 'efectivo' ? only : S.accounts.find(a => a.type === 'banco')?.id, to: cash?.id };
+    if (!only) return null;
+    if (isDeposit && acc(only).type !== 'efectivo' && role !== 'from') return { from: cash?.id, to: only }; // «deposité 300 en el bcp»
+    if (role === 'to') return { from: null, to: only }; // «pasé 100 a ahorros»
+    return null; // «le pasé 50 a mi mamá en efectivo», «transferí 500 interbank a juan»: gasto
+  };
 
   let type = /^\s*\+/.test(text) || RX_INCOME.test(n) ? 'ingreso' : 'gasto';
   let accountId = null, toAccountId = null, debtId = null, categoryId = null;
@@ -236,21 +367,25 @@ function parse(raw) {
     const guess = findCategory(tokens, 'gasto');
     if (RX_PAY.test(n) && debtHit && !guess) {
       type = 'pago_deuda'; debtId = debtHit.id; accountId = nonCredit[0] || null;
-    } else if (RX_PAY.test(n) && credit && !guess) {
+    } else if (RX_PAY.test(n) && credit && !guess && roleOf(credit) !== 'via') {
+      // «pagué la cmr desde débito»; en cambio «pagué 120 con la cmr» es una compra con la tarjeta
       type = 'transferencia'; toAccountId = credit; accountId = nonCredit[0] || null;
     } else if (RX_SAVE.test(n) && savings) {
       type = 'transferencia'; toAccountId = savings.id;
       accountId = accs.ids.find(id => id !== savings.id) || null;
-    } else if (RX_TRANSFER.test(n) && (accs.ids.length >= 2 || /(^|\s)(retire|retiro)(\s|$)/.test(n))) {
-      type = 'transferencia';
-      if (accs.ids.length >= 2) { accountId = accs.ids[0]; toAccountId = accs.ids[1]; }
-      else { accountId = accs.ids[0] || S.accounts.find(a => a.type === 'banco')?.id; toAccountId = cash?.id; }
+    } else if (RX_TRANSFER.test(n) && (accs.ids.length || isRetire) && planTransfer()) {
+      const tr = planTransfer();
+      type = 'transferencia'; accountId = tr.from || null; toAccountId = tr.to;
     } else {
       categoryId = guess; accountId = accs.ids[0] || null;
     }
   }
 
   if (!accountId || !acc(accountId)) accountId = acc(S.settings.defaultAccount) ? S.settings.defaultAccount : S.accounts[0]?.id;
+  // Una transferencia sin origen dicho no sale de la tarjeta de crédito aunque sea la cuenta por defecto
+  if (type === 'transferencia' && acc(accountId)?.type === 'credito' && !accs.ids.includes(accountId)) {
+    accountId = S.accounts.find(a => a.type !== 'credito' && a.id !== toAccountId)?.id;
+  }
   if (type === 'transferencia' && toAccountId === accountId) {
     accountId = S.accounts.find(a => a.id !== toAccountId && a.type !== 'credito')?.id;
   }
@@ -272,7 +407,10 @@ function parse(raw) {
 
 /* ============ Cálculos ============ */
 // Una tarjeta configurada guarda «lo que debes hoy» como foto; lo registrado antes de esa foto ya está incluido
-const counts = (accountId, t) => { const a = acc(accountId); return t.virtual || !a || !a.setupAt || (t.created || 0) > a.setupAt; };
+const counts = (accountId, t) => {
+  const a = acc(accountId);
+  return t.virtual || !a || !a.setupAt || (t.created || 0) > a.setupAt || t.date > isoDate(new Date(a.setupAt));
+};
 
 // Saldos de cada cuenta; con `upTo` (YYYY-MM-DD) solo cuenta lo registrado hasta ese día
 function balances(upTo, list) {
@@ -340,7 +478,7 @@ function cardInfo(card) {
   }
   let paid = 0;
   for (const t of S.tx) {
-    if (!counts(card.id, t)) continue;
+    if (!counts(card.id, t) || t.date > t0) continue;
     if (t.type === 'gasto' && t.accountId === card.id) {
       const n = t.cuotas || 1, c0 = closeFor(card, t.date);
       if (n === 1) { add(c0, t.amount); continue; }
@@ -353,11 +491,12 @@ function cardInfo(card) {
         if (r.interest && c <= t0) interest.push({ id: `int-${t.id}-${r.k}`, virtual: true, type: 'gasto', categoryId: 'intereses', accountId: card.id, amount: r.interest, date: c, created: 0, note: `Interés cuota ${r.k}/${n}${t.note ? ' · ' + t.note : ''}` });
       });
       if (billed < n) plans.push({ label: t.note || cat(t.categoryId)?.name || 'Compra', cuota: rows[0].amount, left: n - billed, of: n, end: closeAdd(card, c0, n - 1) });
-    } else if (t.type === 'transferencia' && t.accountId === card.id) add(closeFor(card, t.date), t.amount);
+    } else if ((t.type === 'transferencia' || t.type === 'pago_deuda') && t.accountId === card.id) add(closeFor(card, t.date), t.amount);
     else if ((t.type === 'transferencia' && t.toAccountId === card.id) || (t.type === 'ingreso' && t.accountId === card.id)) paid += t.amount;
   }
   // Estados de cuenta en orden; cada pago cubre primero el más antiguo
-  const statements = [{ close: null, due: nextDue(card, setup), amount: card.statement0 || 0 }]
+  // El último estado de cuenta cerró antes de la configuración: vence según ESE cierre, no el siguiente
+  const statements = [{ close: null, due: dueFor(card, closeAdd(card, first, -1)), amount: card.statement0 || 0 }]
     .concat(Object.keys(bills).sort().map(c => ({ close: c, due: dueFor(card, c), amount: bills[c] })));
   let pool = paid;
   for (const s of statements) { const use = Math.min(pool, s.amount); s.left = s.amount - use; pool -= use; }
@@ -367,9 +506,11 @@ function cardInfo(card) {
   return { statements, due, next, interest, plans, credit: pool };
 }
 const cardInterest = () => S.accounts.filter(isCardReady).flatMap(c => cardInfo(c).interest);
-const allTx = () => S.tx.concat(cardInterest());
+// Lo que cuenta hoy: lo registrado hasta hoy (lo de fecha futura queda «programado») más los intereses de cuotas
+const allTx = () => S.tx.filter(t => t.date <= today()).concat(cardInterest());
 function debtRemaining(d, upTo) {
-  const paid = S.tx.filter(t => t.type === 'pago_deuda' && t.debtId === d.id && (!upTo || t.date <= upTo)).reduce((s, t) => s + t.amount, 0);
+  const lim = upTo || today();
+  const paid = S.tx.filter(t => t.type === 'pago_deuda' && t.debtId === d.id && t.date <= lim).reduce((s, t) => s + t.amount, 0);
   return Math.max(0, d.total - (d.paidBefore || 0) - paid);
 }
 function summary(month) {
@@ -447,8 +588,9 @@ function txLine(t) {
     sub.push(a?.name || '?');
     if (t.cuotas > 1) sub.push(`${t.cuotas} cuotas`);
   }
-  return `<button class="item" ${t.virtual ? `data-card="${t.accountId}"` : `data-edit="${t.id}"`}>
-    <span class="ico">${icon}</span>
+  if (t.date > today()) sub.unshift('Programado');
+  return `<button class="item" ${t.virtual ? `data-card="${esc(t.accountId)}"` : `data-edit="${esc(t.id)}"`}>
+    <span class="ico">${esc(icon)}</span>
     <span class="main"><div class="title">${esc(title)}</div><div class="sub">${esc(sub.join(' · '))}</div></span>
     <span class="num ${cls}">${sign}${money(t.amount)}</span>
   </button>`;
@@ -473,16 +615,16 @@ function previewHTML() {
   if (!d) return '';
   const a = acc(d.accountId), c = cat(d.categoryId);
   const chips = [`<button class="chip on" data-pick="type">${TYPES[d.type].icon} ${TYPES[d.type].label}</button>`];
-  if (d.type === 'gasto' || d.type === 'ingreso') chips.push(`<button class="chip" data-pick="categoryId">${c?.icon || ''} ${esc(c?.name || 'Categoría')}</button>`);
+  if (d.type === 'gasto' || d.type === 'ingreso') chips.push(`<button class="chip" data-pick="categoryId">${esc(c?.icon || '')} ${esc(c?.name || 'Categoría')}</button>`);
   if (d.type === 'pago_deuda') chips.push(`<button class="chip" data-pick="debtId">🧾 ${esc(debt(d.debtId)?.name || 'Elige deuda')}</button>`);
   chips.push(`<button class="chip" data-pick="accountId">${ACC_ICON[a?.type] || ''} ${d.type === 'transferencia' ? 'De ' : ''}${esc(a?.name || 'Cuenta')}</button>`);
   if (d.type === 'transferencia') { const ta = acc(d.toAccountId); chips.push(`<button class="chip" data-pick="toAccountId">${ACC_ICON[ta?.type] || ''} A ${esc(ta?.name || 'Cuenta')}</button>`); }
   if (d.onCard) {
     const cuota = d.amount && d.cuotas > 1 ? ` · ${money(cuotaSchedule(d.amount, d.cuotas, d.tea)[0].amount)}/mes` : '';
     chips.push(`<button class="chip" data-pick="cuotas">📆 ${d.cuotas === 1 ? '1 cuota' : d.cuotas + ' cuotas'}${cuota}</button>`);
-    if (d.cuotas > 1) chips.push(`<button class="chip ${d.sinInteres ? 'on' : ''}" data-pick="sinInteres">${d.sinInteres ? 'Sin intereses' : `TEA ${d.tea}%`}</button>`);
+    if (d.cuotas > 1) chips.push(`<button class="chip ${d.sinInteres ? 'on' : ''}" data-pick="sinInteres">${d.sinInteres ? 'Sin intereses' : d.tea ? `TEA ${d.tea}%` : 'TEA sin configurar'}</button>`);
   }
-  chips.push(`<label class="chip">📅 ${esc(dayLabel(d.date))}<input type="date" id="pdate" value="${d.date}"></label>`);
+  chips.push(`<label class="chip">📅 ${esc(dayLabel(d.date))}<input type="date" id="pdate" max="${today()}" value="${esc(d.date)}"></label>`);
   return `<div class="preview">
     <div class="amount-line"><span class="muted">S/</span><input id="pamt" inputmode="decimal" placeholder="0.00" value="${d.amount ? (d.amount / 100).toFixed(2) : ''}"></div>
     <input class="note" id="pnote" placeholder="Descripción" value="${esc(d.note)}">
@@ -513,7 +655,7 @@ function bindComposer() {
     $('#saveq').disabled = !draft()?.amount;
   });
   $('#preview').addEventListener('change', e => {
-    if (e.target.id === 'pdate' && e.target.value) { V.over.date = e.target.value; refreshPreview(); }
+    if (e.target.id === 'pdate' && e.target.value) { V.over.date = e.target.value > today() ? today() : e.target.value; refreshPreview(); }
   });
   $('#preview').addEventListener('click', e => {
     const b = e.target.closest('[data-pick]');
@@ -561,15 +703,21 @@ function saveDraft() {
   const d = draft();
   if (!d || !d.amount) { toast('Falta el monto'); return; }
   if (d.type === 'pago_deuda' && !debt(d.debtId)) { toast('Elige a qué deuda va el pago'); return; }
+  if (d.date > today()) { toast('La fecha no puede ser futura'); return; }
   const t = { id: uid(), type: d.type, amount: d.amount, date: d.date, note: (d.note || '').trim(), accountId: d.accountId, created: Date.now() };
   if (d.type === 'gasto' || d.type === 'ingreso') t.categoryId = d.categoryId;
   if (d.type === 'transferencia') t.toAccountId = d.toAccountId;
   if (d.type === 'pago_deuda') t.debtId = d.debtId;
-  if (d.onCard && d.cuotas > 1) { t.cuotas = d.cuotas; t.tea = d.tea; }
+  // Sin intereses se guarda como decisión; si no, la compra sigue la TEA de la tarjeta (aunque se configure después)
+  if (d.onCard && d.cuotas > 1) {
+    t.cuotas = d.cuotas;
+    const ct = acc(d.accountId).tea;
+    if (d.sinInteres) { t.tea = 0; t.sinInteres = true; } else if (ct > 0) t.tea = ct; // sin TEA configurada: se fija al configurarla
+  }
   // Aprende: si corregiste la categoría, la próxima vez esas palabras van ahí
   if (V.over.learn && t.categoryId) d.keys.forEach(k => { S.rules[k] = t.categoryId; });
   S.tx.push(t);
-  save();
+  if (!save()) { render(); return; } // save() ya volvió a lo guardado; el texto queda para reintentar
   lastSaved = t.id;
   V.text = ''; V.over = {};
   render();
@@ -600,16 +748,18 @@ function viewInicio() {
 
   return `
   <h1>Finanzas</h1>
+  ${updateBanner()}
+  ${loadErrorBanner()}
   ${needBackup ? `<div class="banner"><span>Tus datos viven solo en este iPhone. Haz un respaldo.</span><button class="linkbtn" data-act="backup">Respaldar</button></div>` : ''}
   ${viewComposer()}
   ${cardAlerts.map(({ c, due }) => {
     const soon = due.overdue || (parseDate(due.date) - parseDate(today())) / 864e5 <= 3;
-    return `<button class="banner" data-card="${c.id}" style="width:100%;border:0;margin-top:10px;text-align:left${soon ? ';background:color-mix(in srgb, var(--gasto) 18%, transparent)' : ''}">
+    return `<button class="banner" data-card="${esc(c.id)}" style="width:100%;border:0;margin-top:10px;text-align:left${soon ? ';background:color-mix(in srgb, var(--gasto) 18%, transparent)' : ''}">
       <span>💳 <b>${esc(c.name)}</b>: paga ${money(due.amount)} ${due.overdue ? '— venció el' : 'hasta el'} ${fmtShort(due.date)}</span><span class="linkbtn">Ver</span></button>`;
   }).join('')}
   ${debtAlerts.map(d => {
     const late = d.due < today();
-    return `<button class="banner" data-debt="${d.id}" style="width:100%;border:0;margin-top:10px;text-align:left${late || (parseDate(d.due) - parseDate(today())) / 864e5 <= 3 ? ';background:color-mix(in srgb, var(--gasto) 18%, transparent)' : ''}">
+    return `<button class="banner" data-debt="${esc(d.id)}" style="width:100%;border:0;margin-top:10px;text-align:left${late || (parseDate(d.due) - parseDate(today())) / 864e5 <= 3 ? ';background:color-mix(in srgb, var(--gasto) 18%, transparent)' : ''}">
       <span>🧾 <b>${esc(d.name)}</b>: ${money(debtRemaining(d))} ${late ? '— venció el' : 'vence el'} ${fmtShort(d.due)}</span><span class="linkbtn">Ver</span></button>`;
   }).join('')}
 
@@ -628,7 +778,7 @@ function viewInicio() {
       <div style="text-align:right"><div class="muted small">Nivel de ahorro</div><div style="font-size:22px;font-weight:700" class="${rate !== null && rate < goal ? 'gasto' : 'ingreso'}">${rate === null ? '—' : rate + '%'}</div></div>
     </div>
     <div class="bar ${rate !== null && rate < goal ? 'warn' : ''}"><i style="width:${rate === null ? 0 : Math.max(0, Math.min(100, (rate / goal) * 100))}%"></i></div>
-    <div class="muted small" style="margin-top:6px">Meta: ahorrar ${goal}% de lo que entra${s.debtPay ? ` · pagaste ${money(s.debtPay)} de deudas` : ''}${s.saved ? ` · separaste ${money(s.saved)} a ahorros` : ''}</div>
+    <div class="muted small" style="margin-top:6px">Meta: ahorrar ${esc(goal)}% de lo que entra${s.debtPay ? ` · pagaste ${money(s.debtPay)} de deudas` : ''}${s.saved ? ` · separaste ${money(s.saved)} a ahorros` : ''}</div>
   </div>
 
   <div class="grid2" style="margin-top:10px">
@@ -638,12 +788,12 @@ function viewInicio() {
 
   ${incList.length ? `<h2>De dónde vino</h2>
   <div class="card">
-    ${incList.map(([id, v]) => `<div class="catrow"><span>${cat(id)?.icon || '•'}</span><span>${esc(cat(id)?.name || 'Sin categoría')}</span><span class="num ingreso">${money(v)}</span><div class="bar"><i style="width:${(v / incList[0][1]) * 100}%;background:var(--ingreso)"></i></div></div>`).join('')}
+    ${incList.map(([id, v]) => `<div class="catrow"><span>${esc(cat(id)?.icon || '•')}</span><span>${esc(cat(id)?.name || 'Sin categoría')}</span><span class="num ingreso">${money(v)}</span><div class="bar"><i style="width:${(v / incList[0][1]) * 100}%;background:var(--ingreso)"></i></div></div>`).join('')}
   </div>` : ''}
 
   <h2>En qué se fue</h2>
   <div class="card">
-    ${cats.length ? cats.map(([id, v]) => `<div class="catrow"><span>${cat(id)?.icon || '•'}</span><span>${esc(cat(id)?.name || 'Sin categoría')}</span><span class="num">${money(v)}</span><div class="bar"><i style="width:${(v / max) * 100}%;background:var(--s1)"></i></div></div>`).join('') : '<div class="empty">Sin gastos este mes</div>'}
+    ${cats.length ? cats.map(([id, v]) => `<div class="catrow"><span>${esc(cat(id)?.icon || '•')}</span><span>${esc(cat(id)?.name || 'Sin categoría')}</span><span class="num">${money(v)}</span><div class="bar"><i style="width:${(v / max) * 100}%;background:var(--s1)"></i></div></div>`).join('') : '<div class="empty">Sin gastos este mes</div>'}
   </div>
 
   <h2>Últimos movimientos</h2>
@@ -655,9 +805,9 @@ const byNewest = (a, b) => b.date.localeCompare(a.date) || b.created - a.created
 
 function viewMovs() {
   const q = norm(V.search.trim());
-  let list = allTx().filter(t => t.date.startsWith(V.month));
-  const inc = list.filter(t => t.type === 'ingreso').reduce((x, t) => x + t.amount, 0);
-  const exp = list.filter(t => t.type === 'gasto').reduce((x, t) => x + t.amount, 0);
+  let list = S.tx.concat(cardInterest()).filter(t => t.date.startsWith(V.month)); // incluye lo programado
+  const sumOf = (type, fut) => list.filter(t => t.type === type && (t.date > today()) === fut).reduce((x, t) => x + t.amount, 0);
+  const inc = sumOf('ingreso', false), exp = sumOf('gasto', false), incP = sumOf('ingreso', true), expP = sumOf('gasto', true);
   if (V.filter === 'gasto') list = list.filter(t => t.type === 'gasto');
   if (V.filter === 'ingreso') list = list.filter(t => t.type === 'ingreso');
   if (V.filter === 'otros') list = list.filter(t => t.type === 'transferencia' || t.type === 'pago_deuda');
@@ -674,7 +824,7 @@ function viewMovs() {
     <button data-month="1" aria-label="Mes siguiente">›</button>
   </div>
   <div class="seg">${[['todo', 'Todo'], ['gasto', 'Gastos'], ['ingreso', 'Ingresos'], ['otros', 'Pagos y mov.']].map(([k, l]) => `<button data-filter="${k}" class="${V.filter === k ? 'on' : ''}">${l}</button>`).join('')}</div>
-  ${V.filter === 'ingreso' ? `<div class="muted small" style="margin:0 4px">Entró ${money(inc)} este mes</div>` : V.filter === 'gasto' ? `<div class="muted small" style="margin:0 4px">Salió ${money(exp)} este mes</div>` : ''}
+  ${V.filter === 'ingreso' ? `<div class="muted small" style="margin:0 4px">Entró ${money(inc)} este mes${incP ? ` · ${money(incP)} programado` : ''}</div>` : V.filter === 'gasto' ? `<div class="muted small" style="margin:0 4px">Salió ${money(exp)} este mes${expP ? ` · ${money(expP)} programado` : ''}</div>` : ''}
   ${list.length ? Object.entries(groups).map(([d, ts]) => `<div class="day">${esc(dayLabel(d))}</div><div class="list">${ts.map(txLine).join('')}</div>`).join('') : '<div class="card empty">Nada por aquí</div>'}
   `;
 }
@@ -694,7 +844,7 @@ function viewCuentas() {
         const due = cardInfo(a)?.due;
         sub = !isCardReady(a) ? 'Toca para poner línea y fechas' : due ? `Pagar ${money(due.amount)} ${due.overdue ? '· vencido' : 'hasta el ' + fmtShort(due.date)}` : 'Al día';
       }
-      return `<button class="item" ${isCredit ? `data-card="${a.id}"` : `data-acc="${a.id}"`}><span class="ico">${ACC_ICON[a.type]}</span>
+      return `<button class="item" ${isCredit ? `data-card="${esc(a.id)}"` : `data-acc="${esc(a.id)}"`}><span class="ico">${ACC_ICON[a.type]}</span>
         <span class="main"><div class="title">${esc(a.name)}</div><div class="sub">${esc(sub)}</div></span>
         <span class="num ${(isCredit && v < 0) || v < 0 ? 'gasto' : ''}">${txt}</span></button>`;
     }).join('')}
@@ -704,7 +854,7 @@ function viewCuentas() {
   <h2>Deudas</h2>
   ${S.debts.length ? `<div class="list">${S.debts.map(d => {
       const rem = debtRemaining(d), pct = d.total ? Math.round(((d.total - rem) / d.total) * 100) : 0;
-      return `<button class="item" data-debt="${d.id}"><span class="ico">🧾</span>
+      return `<button class="item" data-debt="${esc(d.id)}"><span class="ico">🧾</span>
         <span class="main"><div class="title">${esc(d.name)}</div><div class="sub">${esc([d.due && rem ? (d.due < today() ? 'Venció el ' : 'Vence el ') + fmtShort(d.due) : '', d.note, pct ? `pagado ${pct}%` : ''].filter(Boolean).join(' · ') || 'Sin pagos aún')}</div><div class="bar"><i style="width:${pct}%"></i></div></span>
         <span class="num ${rem ? 'gasto' : 'ingreso'}">${rem ? money(rem) : 'Pagada'}</span></button>`;
     }).join('')}</div>` : '<div class="card empty small">Préstamos, cuotas o lo que le debas a alguien. La tarjeta de crédito se calcula sola arriba.</div>'}
@@ -723,16 +873,18 @@ function viewAjustes() {
   const rules = Object.entries(S.rules);
   return `
   <h1>Ajustes</h1>
+  ${updateBanner()}
+  ${loadErrorBanner()}
   <h2>General</h2>
   <div class="card">
     <label class="field"><span>Cuenta por defecto (si no dices cuál)</span>
-      <select id="set-def">${S.accounts.map(a => `<option value="${a.id}" ${a.id === S.settings.defaultAccount ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
+      <select id="set-def">${S.accounts.map(a => `<option value="${esc(a.id)}" ${a.id === S.settings.defaultAccount ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
     <label class="field" style="margin:0"><span>Meta de ahorro (% de tus ingresos)</span>
-      <input id="set-goal" type="number" inputmode="numeric" min="0" max="100" value="${S.settings.savingGoalPct}"></label>
+      <input id="set-goal" type="number" inputmode="numeric" min="0" max="100" value="${esc(S.settings.savingGoalPct)}"></label>
   </div>
 
   <h2>Categorías</h2>
-  <div class="list">${S.categories.map(c => `<button class="item" data-cat="${c.id}"><span class="ico">${c.icon}</span><span class="main"><div class="title">${esc(c.name)}</div><div class="sub">${c.kind === 'ingreso' ? 'Ingreso' : 'Gasto'}${c.words ? ' · ' + esc(c.words.split(/\s+/).slice(0, 6).join(', ')) + '…' : ''}</div></span></button>`).join('')}</div>
+  <div class="list">${S.categories.map(c => `<button class="item" data-cat="${esc(c.id)}"><span class="ico">${esc(c.icon)}</span><span class="main"><div class="title">${esc(c.name)}</div><div class="sub">${c.kind === 'ingreso' ? 'Ingreso' : 'Gasto'}${c.words ? ' · ' + esc(c.words.split(/\s+/).slice(0, 6).join(', ')) + '…' : ''}</div></span></button>`).join('')}</div>
   <button class="linkbtn" data-act="new-cat" style="margin:8px 4px">+ Agregar categoría</button>
 
   <h2>Lo que aprendí (${rules.length})</h2>
@@ -756,15 +908,22 @@ function viewAjustes() {
 }
 
 /* ============ Hoja inferior ============ */
-function openSheet(html, onMount) {
+// keepScroll: al redibujar la misma hoja (agregar una fila, cambiar el tipo) no saltar arriba
+function openSheet(html, onMount, keepScroll) {
   const sh = $('#sheet');
+  const prevTop = keepScroll && !sh.hidden ? $('.sheet-body', sh)?.scrollTop || 0 : 0;
   sh.onclick = sh.oninput = sh.onchange = null;
-  sh.innerHTML = '<div class="grab"></div><button class="sheet-x" aria-label="Cerrar">✕</button>' + html;
-  sh.classList.remove('closing'); sh.style.transform = ''; sh.scrollTop = 0;
+  sh.innerHTML = '<div class="sheet-head"><div class="grab"></div><button class="sheet-x" aria-label="Cerrar">✕</button></div><div class="sheet-body">' + html + '</div>';
+  sh.style.transform = '';
   sh.hidden = false; $('#backdrop').hidden = false; $('#toast').hidden = true;
+  document.documentElement.classList.add('sheet-open');
+  $('.sheet-body', sh).scrollTop = prevTop;
   if (onMount) onMount(sh);
 }
-function closeSheet() { $('#sheet').hidden = true; $('#backdrop').hidden = true; $('#sheet').innerHTML = ''; }
+function closeSheet() {
+  $('#sheet').hidden = true; $('#backdrop').hidden = true; $('#sheet').innerHTML = '';
+  document.documentElement.classList.remove('sheet-open');
+}
 
 function picker(title, opts, current, onPick) {
   openSheet(`<h3>${esc(title)}</h3>${opts.map(o => `<button class="opt ${o.value === current ? 'on' : ''}" data-v="${esc(o.value)}">${esc(o.label)}</button>`).join('')}`, sh => {
@@ -776,25 +935,25 @@ function editTx(id) {
   const t = S.tx.find(x => x.id === id);
   if (!t) return;
   let type = t.type;
-  const draw = () => {
-    const catOpts = S.categories.filter(c => c.kind === type).map(c => `<option value="${c.id}" ${c.id === t.categoryId ? 'selected' : ''}>${c.icon} ${esc(c.name)}</option>`).join('');
-    const accOpts = sel => S.accounts.map(a => `<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
+  const draw = keep => {
+    const catOpts = S.categories.filter(c => c.kind === type).map(c => `<option value="${esc(c.id)}" ${c.id === t.categoryId ? 'selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('');
+    const accOpts = sel => S.accounts.map(a => `<option value="${esc(a.id)}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
     openSheet(`<h3>Editar movimiento</h3>
       <div class="seg">${Object.entries(TYPES).map(([k, v]) => `<button data-type="${k}" class="${k === type ? 'on' : ''}">${v.label}</button>`).join('')}</div>
       <label class="field"><span>Monto (S/)</span><input id="e-amt" inputmode="decimal" value="${(t.amount / 100).toFixed(2)}"></label>
       <label class="field"><span>Descripción</span><input id="e-note" value="${esc(t.note)}"></label>
       ${type === 'gasto' || type === 'ingreso' ? `<label class="field"><span>Categoría</span><select id="e-cat">${catOpts}</select></label>` : ''}
-      ${type === 'pago_deuda' ? `<label class="field"><span>Deuda</span><select id="e-debt">${S.debts.map(d => `<option value="${d.id}" ${d.id === t.debtId ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select></label>` : ''}
+      ${type === 'pago_deuda' ? `<label class="field"><span>Deuda</span><select id="e-debt">${S.debts.map(d => `<option value="${esc(d.id)}" ${d.id === t.debtId ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select></label>` : ''}
       <label class="field"><span>${type === 'transferencia' ? 'Desde' : 'Cuenta'}</span><select id="e-acc">${accOpts(t.accountId)}</select></label>
       ${type === 'transferencia' ? `<label class="field"><span>Hacia</span><select id="e-to">${accOpts(t.toAccountId)}</select></label>` : ''}
       ${type === 'gasto' && S.accounts.some(a => a.type === 'credito') ? `<div class="grid2">
         <label class="field"><span>Cuotas (solo tarjeta)</span><input id="e-cuotas" inputmode="numeric" value="${t.cuotas || 1}"></label>
         <label class="field"><span>TEA (%)</span><input id="e-tea" inputmode="decimal" value="${t.tea ?? ''}" placeholder="la de la tarjeta"></label></div>` : ''}
-      <label class="field"><span>Fecha</span><input id="e-date" type="date" value="${t.date}"></label>
+      <label class="field"><span>Fecha</span><input id="e-date" type="date" max="${t.date > today() ? esc(t.date) : today()}" value="${esc(t.date)}"></label>
       <div class="actions"><button class="btn danger" id="e-del">Eliminar</button><button class="btn primary" id="e-save">Guardar</button></div>`, sh => {
       sh.onclick = e => {
         const tb = e.target.closest('[data-type]');
-        if (tb) { type = tb.dataset.type; draw(); return; }
+        if (tb) { type = tb.dataset.type; draw(true); return; }
         if (e.target.id === 'e-del') {
           if (!confirm('¿Eliminar este movimiento?')) return;
           S.tx = S.tx.filter(x => x.id !== id); save(); closeSheet(); render();
@@ -803,6 +962,8 @@ function editTx(id) {
           const amount = toCents($('#e-amt').value);
           if (!amount) return toast('Monto inválido');
           if (type === 'pago_deuda' && !$('#e-debt')?.value) return toast('No hay deudas registradas');
+          const nd = $('#e-date').value || t.date;
+          if (nd > today() && nd !== t.date) return toast('La fecha no puede ser futura');
           const newCat = $('#e-cat')?.value;
           if (newCat && newCat !== t.categoryId && t.note) {
             parse(t.note)?.keys.forEach(k => { S.rules[k] = newCat; });
@@ -816,12 +977,13 @@ function editTx(id) {
           delete t.cuotas; delete t.tea;
           if (type === 'gasto' && card?.type === 'credito' && n > 1) {
             const tea = parseFloat(String($('#e-tea').value).replace(',', '.'));
-            t.cuotas = Math.min(60, n); t.tea = isFinite(tea) ? tea : (card.tea || 0);
+            t.cuotas = Math.min(60, n);
+            if (isFinite(tea)) t.tea = tea; else if (card.tea != null) t.tea = card.tea; // vacío: la de la tarjeta
           }
           save(); closeSheet(); render();
         }
       };
-    });
+    }, keep);
   };
   draw();
 }
@@ -831,16 +993,28 @@ function editAccount(id) {
   const isNew = !id;
   const f = {
     name: a.name, type: a.type, aliases: a.aliases, initial: a.initial || 0,
-    limit: a.limit || 0, closeDay: a.closeDay || '', payDay: a.payDay || '', tea: a.tea ?? '',
+    limit: a.limit || 0, closeDay: a.closeDay || '', payDay: a.payDay || '', tea: a.tea > 0 ? a.tea : '',
     statement0: a.statement0 || 0, unbilled: a.unbilled || 0, plans: (a.plans || []).map(p => ({ ...p })),
   };
   const cents = v => (v ? (v / 100).toFixed(2) : '');
+  // Compras ya registradas en esta tarjeta que hoy cuentan por separado
+  const counted = () => S.tx.filter(t => (t.accountId === a.id || t.toAccountId === a.id) && counts(a.id, t) && t.date <= today()).length;
+  const locked = () => a.setupAt && isoDate(new Date(a.setupAt)) !== today() && !f.reset;
+  const dis = () => (locked() ? 'disabled' : '');
+  const snapHead = () => a.setupAt
+    ? `<h2 style="margin:20px 0 6px">Lo que debías al ${fmtShort(isoDate(new Date(a.setupAt)))}</h2>
+       <p class="small muted" style="margin:0 0 10px">Son los montos de cuando configuraste la tarjeta; lo que registraste después se suma aparte. Para poner lo que debes hoy, marca la casilla.</p>
+       <label class="small" style="display:flex;gap:8px;align-items:flex-start;margin-bottom:12px"><input type="checkbox" id="a-reset" ${f.reset ? 'checked' : ''} style="margin-top:3px">
+         <span>Empezar de nuevo desde hoy: estos montos son lo que debo <b>hoy</b> (lo registrado antes en esta tarjeta deja de sumarse)</span></label>`
+    : `<h2 style="margin:20px 0 6px">Lo que debes hoy (opcional)</h2>
+       <p class="small muted" style="margin:0 0 10px">${counted() ? `Ya registraste ${counted()} movimientos en esta tarjeta. Si llenas estos montos, deben incluirlos: desde hoy esos movimientos dejarán de sumarse aparte.` : 'Llénalo con tu último estado de cuenta para que la app sepa cuánto debes.'}</p>`;
   const days = sel => '<option value="">—</option>' + Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}" ${Number(sel) === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('');
   const read = () => {
     const sh = $('#sheet'), val = q => $(q, sh)?.value;
     f.name = val('#a-name') ?? f.name;
     f.aliases = val('#a-alias') ?? f.aliases;
-    if ($('#a-init', sh)) f.initial = toCents(val('#a-init')) || 0;
+    if ($('#a-init', sh)) f.initial = ($('#a-neg', sh)?.checked || /^\s*-/.test(val('#a-init')) ? -1 : 1) * (toCents(val('#a-init')) || 0);
+    if ($('#a-reset', sh)) f.reset = $('#a-reset', sh).checked;
     if ($('#a-limit', sh)) {
       f.limit = toCents(val('#a-limit')) || 0;
       f.closeDay = val('#a-close'); f.payDay = val('#a-pay'); f.tea = val('#a-tea');
@@ -848,7 +1022,7 @@ function editAccount(id) {
       f.plans = $$('.plan-row', sh).map(r => ({ desc: $('.p-desc', r).value.trim(), cuota: toCents($('.p-cuota', r).value) || 0, remaining: Math.max(0, parseInt($('.p-rem', r).value, 10) || 0) }));
     }
   };
-  const draw = () => {
+  const draw = keep => {
     const credit = f.type === 'credito';
     const cardFields = `
       <label class="field"><span>Línea de crédito (S/)</span><input id="a-limit" inputmode="decimal" value="${cents(f.limit)}"></label>
@@ -857,24 +1031,35 @@ function editAccount(id) {
         <label class="field"><span>Último día de pago</span><select id="a-pay">${days(f.payDay)}</select></label>
       </div>
       <label class="field"><span>TEA de compras en cuotas (%)</span><input id="a-tea" inputmode="decimal" value="${esc(f.tea)}" placeholder="Sale en tu estado de cuenta"></label>
-      <h2 style="margin:20px 0 10px">Lo que debes hoy</h2>
-      <label class="field"><span>Monto a pagar de tu último estado de cuenta (S/)</span><input id="a-st0" inputmode="decimal" value="${cents(f.statement0)}" placeholder="0.00"></label>
-      <label class="field"><span>Compras en 1 cuota hechas después del último cierre (S/)</span><input id="a-unb" inputmode="decimal" value="${cents(f.unbilled)}" placeholder="0.00"></label>
+      ${snapHead()}
+      <label class="field"><span>Monto a pagar de tu último estado de cuenta (S/)</span><input id="a-st0" inputmode="decimal" value="${cents(f.statement0)}" placeholder="0.00" ${dis()}></label>
+      <label class="field"><span>Compras en 1 cuota hechas después del último cierre (S/)</span><input id="a-unb" inputmode="decimal" value="${cents(f.unbilled)}" placeholder="0.00" ${dis()}></label>
       <div class="field"><span>Compras en cuotas que ya vienes pagando: la cuota y cuántas faltan después de este estado de cuenta</span>
         ${f.plans.map((p, i) => `<div class="plan-row" style="display:grid;grid-template-columns:1fr 84px 60px 24px;gap:6px;margin-bottom:6px;align-items:center">
-          <input class="p-desc" placeholder="Qué fue" value="${esc(p.desc)}"><input class="p-cuota" inputmode="decimal" placeholder="Cuota" value="${cents(p.cuota)}"><input class="p-rem" inputmode="numeric" placeholder="Faltan" value="${p.remaining || ''}"><button class="linkbtn" data-rmplan="${i}" aria-label="Quitar">✕</button></div>`).join('')}
-        <button class="linkbtn" id="a-addplan">+ Agregar compra en cuotas</button>
+          <input class="p-desc" placeholder="Qué fue" value="${esc(p.desc)}" ${dis()}><input class="p-cuota" inputmode="decimal" placeholder="Cuota" value="${cents(p.cuota)}" ${dis()}><input class="p-rem" inputmode="numeric" placeholder="Faltan" value="${p.remaining || ''}" ${dis()}>${locked() ? '<span></span>' : `<button class="linkbtn" data-rmplan="${i}" aria-label="Quitar">✕</button>`}</div>`).join('')}
+        ${locked() ? '' : '<button class="linkbtn" id="a-addplan">+ Agregar compra en cuotas</button>'}
       </div>`;
     openSheet(`<h3>${isNew ? 'Nueva cuenta' : credit ? 'Configurar tarjeta' : 'Editar cuenta'}</h3>
       <label class="field"><span>Nombre</span><input id="a-name" value="${esc(f.name)}" placeholder="${credit ? 'Ej: CMR, Oh!, Visa BCP' : 'Ej: Plin, BBVA'}"></label>
       <label class="field"><span>Tipo</span><select id="a-type">${Object.entries(ACC_TYPES).map(([k, v]) => `<option value="${k}" ${k === f.type ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-      ${credit ? cardFields : `<label class="field"><span>Saldo al empezar a usar la app (S/)</span><input id="a-init" inputmode="decimal" value="${(f.initial / 100).toFixed(2)}"></label>`}
+      ${credit ? cardFields : `<label class="field"><span>Saldo al empezar a usar la app (S/)</span><input id="a-init" inputmode="decimal" placeholder="0.00" value="${f.initial ? (Math.abs(f.initial) / 100).toFixed(2) : ''}"></label>
+        <label class="small" style="display:flex;gap:8px;align-items:center;margin:-4px 0 12px"><input type="checkbox" id="a-neg" ${f.initial < 0 ? 'checked' : ''}> Está en negativo (sobregiro)</label>`}
       <label class="field"><span>Palabras que la identifican (separadas por coma)</span><input id="a-alias" value="${esc(f.aliases)}" placeholder="Ej: plin, bbva"></label>
       <div class="actions">${isNew ? '' : '<button class="btn danger" id="a-del">Eliminar</button>'}<button class="btn primary" id="a-save">Guardar</button></div>`, sh => {
-      $('#a-type', sh).onchange = e => { read(); f.type = e.target.value; draw(); };
+      $('#a-reset', sh)?.addEventListener('change', e => {
+        read(); f.reset = e.target.checked;
+        // Al desmarcar, la foto vuelve a lo que era: lo escrito mientras estaba marcada no cuenta
+        if (!f.reset) { f.statement0 = a.statement0 || 0; f.unbilled = a.unbilled || 0; f.plans = (a.plans || []).map(p => ({ ...p })); }
+        draw(true);
+      });
+      $('#a-type', sh).onchange = e => {
+        read();
+        if (f.type === 'credito' && e.target.value !== 'credito') f.initial = 0; // la deuda no pasa a ser saldo
+        f.type = e.target.value; draw(true);
+      };
       sh.onclick = e => {
-        if (e.target.id === 'a-addplan') { read(); f.plans.push({ desc: '', cuota: 0, remaining: 0 }); draw(); return; }
-        if (e.target.dataset.rmplan) { read(); f.plans.splice(Number(e.target.dataset.rmplan), 1); draw(); return; }
+        if (e.target.id === 'a-addplan') { read(); f.plans.push({ desc: '', cuota: 0, remaining: 0 }); draw(true); return; }
+        if (e.target.dataset.rmplan) { read(); f.plans.splice(Number(e.target.dataset.rmplan), 1); draw(true); return; }
         if (e.target.id === 'a-del') {
           if (S.tx.some(t => t.accountId === a.id || t.toAccountId === a.id)) return toast('Tiene movimientos: bórralos o muévelos primero');
           if (!confirm(`¿Eliminar ${a.name}?`)) return;
@@ -886,12 +1071,18 @@ function editAccount(id) {
           if (!name) return toast('Ponle un nombre');
           Object.assign(a, { name, type: f.type, aliases: f.aliases });
           if (f.type === 'credito') {
+            // Con la foto bloqueada se conserva la guardada, pase lo que pase en los campos
+            if (locked()) { f.statement0 = a.statement0 || 0; f.unbilled = a.unbilled || 0; f.plans = (a.plans || []).map(p => ({ ...p })); }
             const plans = f.plans.filter(p => p.cuota && p.remaining);
-            // La primera configuración es la foto de partida: lo registrado antes ya está en «lo que debes hoy».
-            // Correcciones posteriores no la mueven, para no perder compras registradas después.
-            if (!a.setupAt) a.setupAt = Date.now();
+            // La foto de partida solo existe si se cargó «lo que debes»: lo registrado antes queda incluido en ella.
+            // Corregirla después no la mueve; «Empezar de nuevo desde hoy» sí. Vaciarla el mismo día la quita.
+            const hasSnap = f.statement0 || f.unbilled || plans.length;
+            if ((!a.setupAt && hasSnap) || (a.setupAt && f.reset)) a.setupAt = Date.now();
+            else if (a.setupAt && !hasSnap && isoDate(new Date(a.setupAt)) === today()) delete a.setupAt;
             const tea = parseFloat(String(f.tea).replace(',', '.'));
-            Object.assign(a, { limit: f.limit, closeDay: Number(f.closeDay) || null, payDay: Number(f.payDay) || null, tea: isFinite(tea) ? tea : 0, statement0: f.statement0, unbilled: f.unbilled, plans });
+            // La primera vez que se pone la TEA, las compras en cuotas que no la tenían la toman
+            if (!(a.tea > 0) && tea > 0) S.tx.forEach(t => { if (t.accountId === a.id && t.cuotas > 1 && t.tea == null) t.tea = tea; });
+            Object.assign(a, { limit: f.limit, closeDay: Number(f.closeDay) || null, payDay: Number(f.payDay) || null, tea: tea > 0 ? tea : null, statement0: f.statement0, unbilled: f.unbilled, plans });
             a.initial = -(f.statement0 + f.unbilled + plans.reduce((x, p) => x + p.cuota * p.remaining, 0));
           } else {
             a.initial = f.initial;
@@ -902,7 +1093,7 @@ function editAccount(id) {
           if (f.type === 'credito' && isCardReady(a)) cardSheet(a.id);
         }
       };
-    });
+    }, keep);
   };
   draw();
 }
@@ -950,29 +1141,31 @@ function payCard(id, suggested) {
   const c = acc(id);
   openSheet(`<h3>Pagar ${esc(c.name)}</h3>
     <label class="field"><span>Monto (S/)</span><input id="k-amt" inputmode="decimal" value="${suggested ? (suggested / 100).toFixed(2) : ''}" placeholder="0.00"></label>
-    <label class="field"><span>Desde</span><select id="k-from">${S.accounts.filter(a => a.type !== 'credito').map(a => `<option value="${a.id}" ${a.id === S.settings.defaultAccount ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
+    <label class="field"><span>Desde</span><select id="k-from">${S.accounts.filter(a => a.type !== 'credito').map(a => `<option value="${esc(a.id)}" ${a.id === S.settings.defaultAccount ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
     <button class="btn primary block" id="k-save">Registrar pago</button>`, sh => {
     sh.onclick = e => {
       if (e.target.id !== 'k-save') return;
       const amount = toCents($('#k-amt').value);
       if (!amount) return toast('Pon el monto');
       S.tx.push({ id: uid(), type: 'transferencia', amount, accountId: $('#k-from').value, toAccountId: id, date: today(), note: '', created: Date.now() });
-      save(); render(); cardSheet(id);
-      toast(`Pago de ${money(amount)} a ${c.name} registrado`);
+      const ok = save(); render(); cardSheet(id);
+      if (ok) toast(`Pago de ${money(amount)} a ${c.name} registrado`);
     };
   });
 }
 
 function simulate(id) {
   const c = acc(id), info = cardInfo(c);
-  const st = { amount: '', n: 12, tea: c.tea || 0, free: false };
+  const st = { amount: '', n: 12, tea: c.tea > 0 ? c.tea : '', free: false };
   const incomes = [1, 2, 3].map(k => summary(shiftMonth(monthKey(today()), -k)).inc).filter(v => v > 0);
   const avgIncome = incomes.length ? incomes.reduce((x, y) => x + y, 0) / incomes.length : 0;
   const results = () => {
     const P = toCents(st.amount);
     if (!P) return '<p class="muted small">Pon el precio para ver las cuotas.</p>';
     const n = Math.max(1, Math.min(60, parseInt(st.n, 10) || 1));
-    const tea = st.free ? 0 : parseFloat(String(st.tea).replace(',', '.')) || 0;
+    const teaIn = parseFloat(String(st.tea).replace(',', '.'));
+    if (!st.free && !isFinite(teaIn)) return '<p class="small gasto">Pon la TEA de tu tarjeta (sale en el estado de cuenta) o marca «Sin intereses».</p>';
+    const tea = st.free ? 0 : teaIn;
     const rows = cuotaSchedule(P, n, tea), total = rows.reduce((x, r) => x + r.amount, 0);
     const c0 = closeFor(c, today()), debtNow = Math.max(0, -(balances()[c.id] || 0));
     const bill = cl => info.statements.find(s => s.close === cl)?.left || 0;
@@ -1000,13 +1193,13 @@ function simulate(id) {
     <div class="field"><span>Cuotas</span><div class="chips" id="s-chips">${[1, 3, 6, 12, 18, 24, 36].map(k => `<button class="chip ${k === st.n ? 'on' : ''}" data-n="${k}">${k}</button>`).join('')}
       <input id="s-n" inputmode="numeric" value="${st.n}" style="width:64px;padding:6px 10px"></div></div>
     <div class="grid2" style="align-items:end">
-      <label class="field"><span>TEA (%)</span><input id="s-tea" inputmode="decimal" value="${st.tea}"></label>
+      <label class="field"><span>TEA (%)</span><input id="s-tea" inputmode="decimal" value="${esc(st.tea)}" placeholder="Ej: 65"></label>
       <div class="field"><button class="chip" id="s-free" style="width:100%;justify-content:center;padding:12px">Sin intereses</button></div>
     </div>
     <div id="s-res">${results()}</div>
     <h2>Si decides comprarlo</h2>
     <label class="field"><span>Qué es</span><input id="s-note" placeholder="Ej: Laptop"></label>
-    <label class="field"><span>Categoría</span><select id="s-cat">${S.categories.filter(x => x.kind === 'gasto').map(x => `<option value="${x.id}" ${x.id === 'ropa' ? 'selected' : ''}>${x.icon} ${esc(x.name)}</option>`).join('')}</select></label>
+    <label class="field"><span>Categoría</span><select id="s-cat">${S.categories.filter(x => x.kind === 'gasto').map(x => `<option value="${esc(x.id)}" ${x.id === 'ropa' ? 'selected' : ''}>${esc(x.icon)} ${esc(x.name)}</option>`).join('')}</select></label>
     <button class="btn primary block" id="s-save">Registrar esta compra</button>`, sh => {
     const refresh = () => {
       $('#s-res').innerHTML = results();
@@ -1028,9 +1221,14 @@ function simulate(id) {
         const amount = toCents(st.amount), n = Math.max(1, Math.min(60, parseInt(st.n, 10) || 1));
         if (!amount) return toast('Pon el precio');
         const t = { id: uid(), type: 'gasto', amount, date: today(), note: $('#s-note').value.trim(), accountId: id, categoryId: $('#s-cat').value, created: Date.now() };
-        if (n > 1) { t.cuotas = n; t.tea = st.free ? 0 : parseFloat(String(st.tea).replace(',', '.')) || 0; }
-        S.tx.push(t); save(); render(); cardSheet(id);
-        toast(`Compra registrada en ${n === 1 ? '1 cuota' : n + ' cuotas'}`);
+        if (n > 1) {
+          const teaIn = parseFloat(String(st.tea).replace(',', '.'));
+          if (!st.free && !isFinite(teaIn)) return toast('Pon la TEA o marca «Sin intereses»');
+          t.cuotas = n; t.tea = st.free ? 0 : teaIn;
+          if (st.free) t.sinInteres = true;
+        }
+        S.tx.push(t); const ok = save(); render(); cardSheet(id);
+        if (ok) toast(`Compra registrada en ${n === 1 ? '1 cuota' : n + ' cuotas'}`);
       }
     };
   });
@@ -1039,25 +1237,30 @@ function simulate(id) {
 function editDebt(id) {
   const d = id ? debt(id) : { id: uid(), name: '', total: 0, paidBefore: 0 };
   const isNew = !id;
+  const onOld = sh => { const c = $('#d-old', sh); if (c) c.onchange = () => { $('#d-since-wrap').hidden = c.checked; }; };
   openSheet(`<h3>${isNew ? 'Nueva deuda' : esc(d.name)}</h3>
     ${isNew ? '' : `<p class="muted small" style="margin-top:-6px">Falta pagar ${money(debtRemaining(d))}</p>
     <div class="card" style="background:var(--bg);box-shadow:none;margin-bottom:14px">
       <label class="field"><span>Registrar un pago (S/)</span><input id="p-amt" inputmode="decimal" placeholder="0.00"></label>
-      <label class="field"><span>Desde</span><select id="p-acc">${S.accounts.filter(a => a.type !== 'credito').map(a => `<option value="${a.id}" ${a.id === S.settings.defaultAccount ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
+      <label class="field"><span>Desde</span><select id="p-acc">${S.accounts.filter(a => a.type !== 'credito').map(a => `<option value="${esc(a.id)}" ${a.id === S.settings.defaultAccount ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
       <button class="btn primary block" id="p-save">Registrar pago</button>
     </div>`}
     <label class="field"><span>A quién o qué (ej: Préstamo Tío, Cuotas laptop)</span><input id="d-name" value="${esc(d.name)}"></label>
     <label class="field"><span>Monto total de la deuda (S/)</span><input id="d-total" inputmode="decimal" value="${d.total ? (d.total / 100).toFixed(2) : ''}"></label>
     <label class="field"><span>Ya pagado antes de usar la app (S/)</span><input id="d-paid" inputmode="decimal" value="${d.paidBefore ? (d.paidBefore / 100).toFixed(2) : ''}"></label>
-    <label class="field"><span>Fecha en que vence (opcional)</span><input id="d-due" type="date" value="${d.due || ''}"></label>
+    <label class="field"><span>Fecha en que vence (opcional)</span><input id="d-due" type="date" value="${esc(d.due || '')}"></label>
+    <label class="small" style="display:flex;gap:8px;align-items:flex-start;margin:-2px 0 10px"><input type="checkbox" id="d-old" ${!isNew && !d.since ? 'checked' : ''} style="margin-top:3px">
+      <span>Ya la debía antes de empezar a usar la app</span></label>
+    <label class="field" id="d-since-wrap" ${!isNew && !d.since ? 'hidden' : ''}><span>Desde cuándo la debes</span><input id="d-since" type="date" max="${today()}" value="${esc(d.since || today())}"></label>
     <label class="field"><span>Nota (opcional)</span><input id="d-note" value="${esc(d.note || '')}" placeholder="Ej: se cobra solo de Yape"></label>
     <div class="actions">${isNew ? '' : '<button class="btn danger" id="d-del">Eliminar</button>'}<button class="btn" id="d-save">Guardar</button></div>`, sh => {
+    onOld(sh);
     sh.onclick = e => {
       if (e.target.id === 'p-save') {
         const amount = toCents($('#p-amt').value);
         if (!amount) return toast('Pon el monto del pago');
         S.tx.push({ id: uid(), type: 'pago_deuda', amount, debtId: d.id, accountId: $('#p-acc').value, date: today(), note: '', created: Date.now() });
-        save(); closeSheet(); render(); toast(`Pago de ${money(amount)} registrado`);
+        const ok = save(); closeSheet(); render(); if (ok) toast(`Pago de ${money(amount)} registrado`);
       }
       if (e.target.id === 'd-del') {
         if (S.tx.some(t => t.debtId === d.id)) return toast('Tiene pagos registrados: bórralos primero');
@@ -1068,6 +1271,8 @@ function editDebt(id) {
         const name = $('#d-name').value.trim(), total = toCents($('#d-total').value);
         if (!name || !total) return toast('Falta nombre o monto');
         Object.assign(d, { name, total, paidBefore: toCents($('#d-paid').value) || 0, due: $('#d-due').value || null, note: $('#d-note').value.trim() });
+        // Los gráficos la cuentan desde esa fecha; si ya existía antes, desde siempre
+        d.since = $('#d-old').checked ? null : ($('#d-since').value || today());
         if (isNew) S.debts.push(d);
         save(); closeSheet(); render();
       }
@@ -1099,7 +1304,7 @@ function editCategory(id) {
       if (e.target.id === 'c-save') {
         const name = $('#c-name').value.trim();
         if (!name) return toast('Ponle un nombre');
-        Object.assign(c, { name, icon: $('#c-icon').value.trim() || '🏷️', kind: $('#c-kind').value, words: norm($('#c-words').value).replace(/[^a-z0-9ñ\s]/g, ' ').replace(/\s+/g, ' ').trim() });
+        Object.assign(c, { name, icon: cleanIcon($('#c-icon').value), kind: $('#c-kind').value, words: norm($('#c-words').value).replace(/[^a-z0-9ñ\s]/g, ' ').replace(/\s+/g, ' ').trim() });
         if (isNew) S.categories.push(c);
         save(); closeSheet(); render();
       }
@@ -1108,32 +1313,164 @@ function editCategory(id) {
 }
 
 /* ============ Respaldo ============ */
-async function exportData() {
-  const name = `finanzas-${today()}.json`;
-  const file = new File([JSON.stringify(S, null, 2)], name, { type: 'application/json' });
-  const done = () => { S.settings.lastBackup = today(); save(); render(); };
+// Comparte (iPhone: Guardar en Archivos) o descarga un texto como archivo. Devuelve false si se canceló.
+async function shareText(name, text) {
+  const file = new File([text], name, { type: 'application/json' });
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    try { await navigator.share({ files: [file], title: name }); done(); return; }
-    catch (e) { if (e.name === 'AbortError') return; }
+    try { await navigator.share({ files: [file], title: name }); return true; }
+    catch (e) { if (e.name === 'AbortError') return false; }
   }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(file); a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-  done();
+  return true;
+}
+
+async function exportData() {
+  if (!(await shareText(`finanzas-${today()}.json`, JSON.stringify(S, null, 2)))) return;
+  if (saveFailed) { toast('Respaldo exportado'); return; } // sin espacio no se puede anotar la fecha; el respaldo igual salió
+  S.settings.lastBackup = today(); save(); render();
+}
+
+async function exportCorrupt() {
+  let raw = corruptRaw;
+  try { raw = raw || localStorage.getItem(KEY + '.corrupto'); } catch (e) { /* nada */ }
+  if (!raw) return toast('No hay copia guardada');
+  if (await shareText(`finanzas-copia-ilegible-${today()}.json`, raw)) { corruptExported = true; hideAlert(); render(); }
+}
+
+function dropCorrupt() {
+  if (!confirm('¿Borrar la copia de los datos que no se pudieron leer? Hazlo solo si ya la exportaste.')) return;
+  try { localStorage.removeItem(KEY + '.corrupto'); } catch (e) { /* nada */ }
+  loadError = null; corruptRaw = null; corruptPending = false; render();
+}
+
+const updateBanner = () => (updateReady ? `<div class="banner"><span>Hay una versión nueva de la app.</span><button class="linkbtn" data-act="reload">Actualizar</button></div>` : '');
+
+const loadErrorBanner = () => {
+  if (!loadError && !corruptPending) return '';
+  const msg = loadError
+    ? `No pude leer tus datos guardados (${esc(loadError)}). ${corruptStored ? 'Guardé una copia aparte' : 'No hubo espacio para guardar una copia aparte'}: expórtala${corruptStored ? '' : ' antes de registrar nada'} y no borres la app.`
+    : 'Hay guardada una copia de datos que antes no se pudieron leer. Expórtala si la necesitas y luego bórrala para liberar espacio.';
+  const canDrop = corruptExported || (!loadError && corruptPending);
+  return `<div class="banner" style="background:color-mix(in srgb, var(--gasto) 18%, transparent)"><span>${msg}</span>
+  <span style="display:flex;flex-direction:column;gap:6px"><button class="linkbtn" data-act="export-corrupt">Exportar copia</button>${canDrop ? '<button class="linkbtn" data-act="drop-corrupt">Borrar copia</button>' : ''}</span></div>`;
+};
+
+// Un ícono es uno o dos caracteres visibles (un emoji), nunca HTML
+function cleanIcon(s) {
+  s = String(s ?? '').replace(/[<>"'&`]/g, '').trim();
+  const parts = typeof Intl.Segmenter === 'function' ? [...new Intl.Segmenter().segment(s)].map(x => x.segment) : [...s];
+  return parts.slice(0, 2).join('') || '🏷️';
 }
 
 const looksLikeBackup = t => /^\s*\{/.test(t) && /"accounts"\s*:/.test(t) && /"tx"\s*:/.test(t);
 
+const RX_ID = /^[A-Za-z0-9_-]{1,64}$/, RX_ISO = /^\d{4}-\d{2}-\d{2}$/;
+// Revisa un respaldo campo por campo; lanza un error que dice dónde está el problema
+function validateBackup(data) {
+  const bad = (where, what) => { throw new Error(`${where}: ${what}`); };
+  // Un respaldo trae sus propias cuentas y deudas: nunca se rellenan con las de fábrica
+  if (!data || typeof data !== 'object' || !Array.isArray(data.accounts)) bad('respaldo', 'falta la lista de cuentas («accounts»)');
+  // Un campo que la app no conoce casi siempre es un nombre mal escrito: mejor avisar que perder el dato
+  const KNOWN = {
+    respaldo: ['version', 'accounts', 'categories', 'debts', 'tx', 'rules', 'settings'],
+    cuenta: ['id', 'name', 'type', 'initial', 'aliases', 'limit', 'closeDay', 'payDay', 'tea', 'statement0', 'unbilled', 'plans', 'setupAt'],
+    cuota: ['desc', 'cuota', 'remaining'],
+    categoría: ['id', 'name', 'icon', 'kind', 'words'],
+    deuda: ['id', 'name', 'total', 'paidBefore', 'due', 'note', 'since'],
+    movimiento: ['id', 'type', 'amount', 'date', 'note', 'accountId', 'toAccountId', 'debtId', 'categoryId', 'created', 'cuotas', 'tea', 'sinInteres'],
+    ajustes: ['savingGoalPct', 'defaultAccount', 'lastBackup', 'catsSeen'],
+  };
+  const known = (o, kind, where) => {
+    if (!o || typeof o !== 'object') return;
+    const k = Object.keys(o).find(x => !KNOWN[kind].includes(x));
+    if (k) bad(where, `campo desconocido «${k}»`);
+  };
+  known(data, 'respaldo', 'respaldo');
+  known(data.settings, 'ajustes', 'ajustes');
+  data.accounts.forEach((a, i) => { known(a, 'cuenta', `cuenta ${i + 1}`); (Array.isArray(a && a.plans) ? a.plans : []).forEach((p, j) => known(p, 'cuota', `cuenta ${i + 1}, cuota ${j + 1}`)); });
+  (Array.isArray(data.categories) ? data.categories : []).forEach((c, i) => known(c, 'categoría', `categoría ${i + 1}`));
+  (Array.isArray(data.debts) ? data.debts : []).forEach((d, i) => known(d, 'deuda', `deuda ${i + 1}`));
+  (Array.isArray(data.tx) ? data.tx : []).forEach((t, i) => known(t, 'movimiento', `movimiento ${i + 1}`));
+  data.accounts.forEach((a, i) => { if (!a || !Number.isInteger(a.initial)) bad(`cuenta ${i + 1}`, 'falta el saldo inicial («initial»)'); });
+  if (data.debts != null && !Array.isArray(data.debts)) bad('respaldo', '«debts» no es una lista');
+  const st = normalizeState(data);
+  const realDate = s => RX_ISO.test(s) && isoDate(parseDate(s)) === s;
+  const int = v => Number.isInteger(v);
+  const optInt = v => v == null || int(v);
+  st.accounts.forEach((a, i) => {
+    const w = `cuenta ${i + 1}`;
+    if (!a || !RX_ID.test(a.id)) bad(w, 'id inválido');
+    if (typeof a.name !== 'string' || !a.name.trim()) bad(w, 'sin nombre');
+    if (!Object.prototype.hasOwnProperty.call(ACC_TYPES, a.type)) bad(w, 'tipo desconocido');
+    if (!optInt(a.initial) || !optInt(a.limit) || !optInt(a.statement0) || !optInt(a.unbilled)) bad(w, 'montos inválidos');
+    for (const k of ['closeDay', 'payDay']) if (a[k] != null && !(int(a[k]) && a[k] >= 1 && a[k] <= 31)) bad(w, 'día inválido');
+    if (a.tea != null && !Number.isFinite(a.tea)) bad(w, 'TEA inválida');
+    if (a.setupAt != null && !Number.isFinite(a.setupAt)) bad(w, 'fecha de configuración inválida');
+    if (a.plans != null && (!Array.isArray(a.plans) || a.plans.some(p => !p || !int(p.cuota) || !int(p.remaining)))) bad(w, 'cuotas inválidas');
+    a.aliases = String(a.aliases ?? '');
+  });
+  st.categories.forEach((c, i) => {
+    const w = `categoría ${i + 1}`;
+    if (!c || !RX_ID.test(c.id)) bad(w, 'id inválido');
+    if (typeof c.name !== 'string') bad(w, 'sin nombre');
+    if (c.kind !== 'gasto' && c.kind !== 'ingreso') bad(w, 'tipo desconocido');
+    c.icon = cleanIcon(c.icon); c.words = String(c.words ?? '');
+  });
+  st.debts.forEach((d, i) => {
+    const w = `deuda ${i + 1}`;
+    if (!d || !RX_ID.test(d.id)) bad(w, 'id inválido');
+    if (typeof d.name !== 'string' || !int(d.total) || !optInt(d.paidBefore)) bad(w, 'datos inválidos');
+    if ((d.due != null && !realDate(d.due)) || (d.since != null && !realDate(d.since))) bad(w, 'fecha inválida');
+    d.note = String(d.note ?? '');
+  });
+  st.tx.forEach((t, i) => {
+    const w = `movimiento ${i + 1}`;
+    if (!t || !RX_ID.test(t.id) || !Object.prototype.hasOwnProperty.call(TYPES, t.type)) bad(w, 'id o tipo inválido');
+    if (!realDate(t.date)) bad(w, `fecha inválida (${String(t.date)})`);
+    if (!int(t.amount) || t.amount <= 0) bad(w, 'monto inválido');
+    if (!RX_ID.test(t.accountId)) bad(w, 'cuenta inválida');
+    if (t.type === 'transferencia' && !RX_ID.test(t.toAccountId)) bad(w, 'cuenta de destino inválida');
+    if (t.type === 'pago_deuda' && !RX_ID.test(t.debtId)) bad(w, 'deuda inválida');
+    if (t.categoryId != null && !RX_ID.test(t.categoryId)) bad(w, 'categoría inválida');
+    if (t.cuotas != null && !(int(t.cuotas) && t.cuotas >= 1 && t.cuotas <= 60)) bad(w, 'cuotas inválidas');
+    if (t.tea != null && !Number.isFinite(t.tea)) bad(w, 'TEA inválida');
+    t.created = Number.isFinite(t.created) ? t.created : 0;
+    t.note = String(t.note ?? '');
+  });
+  for (const [k, v] of Object.entries(st.rules)) if (typeof v !== 'string' || !RX_ID.test(v)) delete st.rules[k];
+  // Que todo lo que se nombra exista (un id mal escrito descuadraría los saldos en silencio)
+  const dup = list => list.find((x, i) => list.indexOf(x) !== i);
+  const accIds = st.accounts.map(a => a.id), debtIds = st.debts.map(d => d.id), catIds = st.categories.map(c => c.id);
+  if (dup(accIds)) bad('respaldo', `cuenta repetida «${dup(accIds)}»`);
+  if (dup(debtIds)) bad('respaldo', `deuda repetida «${dup(debtIds)}»`);
+  if (dup(catIds)) bad('respaldo', `categoría repetida «${dup(catIds)}»`);
+  if (dup(st.tx.map(t => t.id))) bad('respaldo', 'movimiento repetido');
+  st.tx.forEach((t, i) => {
+    const w = `movimiento ${i + 1} (${t.date})`;
+    if (!accIds.includes(t.accountId)) bad(w, `la cuenta «${t.accountId}» no existe`);
+    if (t.type === 'transferencia' && !accIds.includes(t.toAccountId)) bad(w, `la cuenta «${t.toAccountId}» no existe`);
+    if (t.type === 'pago_deuda' && !debtIds.includes(t.debtId)) bad(w, `la deuda «${t.debtId}» no existe`);
+    if (t.categoryId != null && !catIds.includes(t.categoryId)) bad(w, `la categoría «${t.categoryId}» no existe`);
+  });
+  return st;
+}
+
 function importText(text) {
+  const prev = S;
   try {
-    const data = JSON.parse(String(text).trim());
-    if (!Array.isArray(data.tx) || !Array.isArray(data.accounts)) throw new Error('No parece un respaldo de esta app');
-    if (!confirm(`Esto reemplaza lo que hay ahora (${S.tx.length} movimientos) por el respaldo (${data.accounts.length} cuentas, ${(data.debts || []).length} deudas, ${data.tx.length} movimientos). ¿Seguir?`)) return false;
-    S = { ...defaults(), ...data, settings: { ...defaults().settings, ...data.settings } };
-    save(); closeSheet(); V.tab = 'inicio'; V.text = ''; V.over = {}; render(); toast('Datos importados');
+    const st = validateBackup(JSON.parse(String(text).trim()));
+    if (!confirm(`Esto reemplaza lo que hay ahora (${S.tx.length} movimientos) por el respaldo (${st.accounts.length} cuentas, ${st.debts.length} deudas, ${st.tx.length} movimientos). ¿Seguir?`)) return false;
+    // Prueba de que se puede mostrar antes de guardar nada
+    S = st;
+    try { viewInicio(); viewMovs(); viewCuentas(); viewGraficos(); viewAjustes(); }
+    catch (e) { throw new Error('el respaldo tiene datos que la app no puede mostrar (' + e.message + ')'); }
+    if (!save()) { S = prev; return false; }
+    closeSheet(); V.tab = 'inicio'; V.text = ''; V.over = {}; render(); toast('Datos importados');
     return true;
-  } catch (e) { toast('No se pudo importar: ' + e.message); return false; }
+  } catch (e) { S = prev; toast('No se pudo importar: ' + e.message); return false; }
 }
 
 async function importData(file) {
@@ -1144,7 +1481,7 @@ async function importData(file) {
 function pasteBackupSheet() {
   openSheet(`<h3>Pegar respaldo</h3>
     <p class="small muted" style="margin-top:-6px">Pega aquí el texto del respaldo (empieza con <code>{</code>).</p>
-    <label class="field"><textarea id="bk-text" rows="8" autocorrect="off" autocapitalize="off" spellcheck="false" style="font:13px ui-monospace,Menlo,monospace"></textarea></label>
+    <label class="field"><textarea id="bk-text" rows="8" autocorrect="off" autocapitalize="off" spellcheck="false" style="font:16px ui-monospace,Menlo,monospace"></textarea></label>
     <button class="btn primary block" id="bk-go">Importar</button>`, sh => {
     navigator.clipboard?.readText?.().then(t => { if (looksLikeBackup(t) && !$('#bk-text').value) $('#bk-text').value = t; }).catch(() => {});
     sh.onclick = e => { if (e.target.id === 'bk-go') importText($('#bk-text').value); };
@@ -1153,13 +1490,23 @@ function pasteBackupSheet() {
 
 /* ============ Toast ============ */
 let toastTimer;
-function toast(msg, actionLabel, action) {
+function toast(msg, actionLabel, action, sticky) {
   const t = $('#toast');
   t.innerHTML = `<span>${esc(msg)}</span>${actionLabel ? `<button>${esc(actionLabel)}</button>` : ''}`;
+  // Con el teclado abierto o una hoja encima, abajo no se vería o taparía botones
+  const typing = document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
+  const top = typing || !$('#sheet').hidden;
+  t.classList.toggle('top', top);
+  const al = $('#alert');
+  t.style.top = top && !al.hidden ? `${al.getBoundingClientRect().bottom + 8}px` : '';
   t.hidden = false;
-  if (actionLabel) $('button', t).onclick = () => { t.hidden = true; action(); };
+  // Sin acción, tocarlo lo cierra; con acción («Deshacer») solo el botón hace algo
+  t.onclick = e => {
+    if (!actionLabel) { t.hidden = true; return; }
+    if (e.target.closest('button')) { t.hidden = true; action(); }
+  };
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, actionLabel ? 5000 : 2800);
+  if (!sticky) toastTimer = setTimeout(() => { t.hidden = true; }, actionLabel ? 5000 : 2800);
 }
 
 /* ============ Eventos globales ============ */
@@ -1169,6 +1516,18 @@ $('#tabs').addEventListener('click', e => {
   V.tab = b.dataset.tab; render(); window.scrollTo(0, 0);
 });
 $('#backdrop').addEventListener('click', closeSheet);
+$('#alert').addEventListener('click', e => {
+  const b = e.target.closest('[data-alert]');
+  if (b && b.dataset.alert === 'export') exportData();
+  if (b && b.dataset.alert === 'export-corrupt') exportCorrupt();
+  if (b && b.dataset.alert === 'close') hideAlert();
+});
+// Si la app está abierta en otra pestaña y guarda, esta relee los datos antes de seguir
+window.addEventListener('storage', e => {
+  if (e.key !== KEY || e.newValue == null) return;
+  S = load(); lastGood = JSON.stringify(S); closeSheet(); render();
+  toast('Se actualizó con cambios de otra pestaña');
+});
 $('#sheet').addEventListener('click', e => { if (e.target.closest('.sheet-x')) closeSheet(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet').hidden) closeSheet(); });
 
@@ -1177,7 +1536,9 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet
   const sh = $('#sheet');
   let y0 = null, dy = 0;
   sh.addEventListener('touchstart', e => {
-    if (sh.scrollTop > 0 || e.target.closest('input, select, textarea')) { y0 = null; return; }
+    const body = $('.sheet-body', sh);
+    const onGrab = !!e.target.closest('.sheet-head'); // la cabecera siempre arrastra
+    if ((!onGrab && body.scrollTop > 0) || e.target.closest('input, select, textarea')) { y0 = null; return; }
     y0 = e.touches[0].clientY; dy = 0;
   }, { passive: true });
   sh.addEventListener('touchmove', e => {
@@ -1210,6 +1571,9 @@ $('#app').addEventListener('click', e => {
   else if (ds.act === 'new-cat') editCategory();
   else if (ds.act === 'backup') exportData();
   else if (ds.act === 'paste-backup') pasteBackupSheet();
+  else if (ds.act === 'export-corrupt') exportCorrupt();
+  else if (ds.act === 'drop-corrupt') dropCorrupt();
+  else if (ds.act === 'reload') location.reload();
   else if (ds.act === 'reset') {
     if (confirm('¿Borrar TODOS los movimientos, cuentas y deudas? Haz un respaldo antes.') && confirm('¿Seguro? No se puede deshacer.')) {
       S = defaults(); save(); render();
@@ -1230,8 +1594,20 @@ $('#app').addEventListener('change', e => {
   if (e.target.id === 'import' && e.target.files[0]) importData(e.target.files[0]);
 });
 
+// Versión de este código; se sube junto con VERSION en sw.js
+const APP_VERSION = 'finanzas-v6';
+let updateReady = false;
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
+  // Si la caché activa es de otra versión, hay una actualización: se ofrece en Inicio y Ajustes (no se recarga sola)
+  const checkUpdate = () => caches.keys().then(ks => {
+    const other = ks.some(k => /^finanzas-v\d+$/.test(k) && k !== APP_VERSION);
+    const mine = ks.includes(APP_VERSION);
+    const ready = other && !mine;
+    if (ready !== updateReady) { updateReady = ready; render(); }
+  }).catch(() => {});
+  navigator.serviceWorker.addEventListener('controllerchange', checkUpdate);
+  checkUpdate();
+  navigator.serviceWorker.register('sw.js').then(r => r.update()).catch(() => {});
 }
 
 // Para pruebas desde la consola
