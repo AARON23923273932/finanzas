@@ -274,11 +274,13 @@ function parse(raw) {
 // Una tarjeta configurada guarda «lo que debes hoy» como foto; lo registrado antes de esa foto ya está incluido
 const counts = (accountId, t) => { const a = acc(accountId); return t.virtual || !a || !a.setupAt || (t.created || 0) > a.setupAt; };
 
-function balances() {
+// Saldos de cada cuenta; con `upTo` (YYYY-MM-DD) solo cuenta lo registrado hasta ese día
+function balances(upTo, list) {
   const b = {};
   S.accounts.forEach(a => { b[a.id] = a.initial || 0; });
   const mv = (id, t, v) => { if (counts(id, t)) b[id] = (b[id] || 0) + v; };
-  for (const t of allTx()) {
+  for (const t of list || allTx()) {
+    if (upTo && t.date > upTo) continue;
     if (t.type === 'gasto' || t.type === 'pago_deuda') mv(t.accountId, t, -t.amount);
     else if (t.type === 'ingreso') mv(t.accountId, t, t.amount);
     else if (t.type === 'transferencia') { mv(t.accountId, t, -t.amount); mv(t.toAccountId, t, t.amount); }
@@ -366,8 +368,8 @@ function cardInfo(card) {
 }
 const cardInterest = () => S.accounts.filter(isCardReady).flatMap(c => cardInfo(c).interest);
 const allTx = () => S.tx.concat(cardInterest());
-function debtRemaining(d) {
-  const paid = S.tx.filter(t => t.type === 'pago_deuda' && t.debtId === d.id).reduce((s, t) => s + t.amount, 0);
+function debtRemaining(d, upTo) {
+  const paid = S.tx.filter(t => t.type === 'pago_deuda' && t.debtId === d.id && (!upTo || t.date <= upTo)).reduce((s, t) => s + t.amount, 0);
   return Math.max(0, d.total - (d.paidBefore || 0) - paid);
 }
 function summary(month) {
@@ -397,7 +399,7 @@ function dayLabel(d) {
 }
 
 /* ============ Estado de la vista ============ */
-const V = { tab: 'inicio', month: monthKey(today()), text: '', over: {}, search: '', mode: 'gasto', filter: 'todo' };
+const V = { tab: 'inicio', month: monthKey(today()), text: '', over: {}, search: '', mode: 'gasto', filter: 'todo', range: 6 };
 let lastSaved = null;
 
 function draft() {
@@ -422,8 +424,9 @@ function draft() {
 function render() {
   $$('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === V.tab));
   const app = $('#app');
-  app.innerHTML = { inicio: viewInicio, movs: viewMovs, cuentas: viewCuentas, ajustes: viewAjustes }[V.tab]();
+  app.innerHTML = { inicio: viewInicio, movs: viewMovs, graficos: viewGraficos, cuentas: viewCuentas, ajustes: viewAjustes }[V.tab]();
   if (V.tab === 'inicio') bindComposer();
+  if (V.tab === 'graficos') mountCharts();
 }
 
 function txLine(t) {
@@ -640,7 +643,7 @@ function viewInicio() {
 
   <h2>En qué se fue</h2>
   <div class="card">
-    ${cats.length ? cats.map(([id, v]) => `<div class="catrow"><span>${cat(id)?.icon || '•'}</span><span>${esc(cat(id)?.name || 'Sin categoría')}</span><span class="num">${money(v)}</span><div class="bar"><i style="width:${(v / max) * 100}%"></i></div></div>`).join('') : '<div class="empty">Sin gastos este mes</div>'}
+    ${cats.length ? cats.map(([id, v]) => `<div class="catrow"><span>${cat(id)?.icon || '•'}</span><span>${esc(cat(id)?.name || 'Sin categoría')}</span><span class="num">${money(v)}</span><div class="bar"><i style="width:${(v / max) * 100}%;background:var(--s1)"></i></div></div>`).join('') : '<div class="empty">Sin gastos este mes</div>'}
   </div>
 
   <h2>Últimos movimientos</h2>
@@ -756,7 +759,8 @@ function viewAjustes() {
 function openSheet(html, onMount) {
   const sh = $('#sheet');
   sh.onclick = sh.oninput = sh.onchange = null;
-  sh.innerHTML = '<div class="grab"></div>' + html;
+  sh.innerHTML = '<div class="grab"></div><button class="sheet-x" aria-label="Cerrar">✕</button>' + html;
+  sh.classList.remove('closing'); sh.style.transform = ''; sh.scrollTop = 0;
   sh.hidden = false; $('#backdrop').hidden = false; $('#toast').hidden = true;
   if (onMount) onMount(sh);
 }
@@ -1165,6 +1169,29 @@ $('#tabs').addEventListener('click', e => {
   V.tab = b.dataset.tab; render(); window.scrollTo(0, 0);
 });
 $('#backdrop').addEventListener('click', closeSheet);
+$('#sheet').addEventListener('click', e => { if (e.target.closest('.sheet-x')) closeSheet(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet').hidden) closeSheet(); });
+
+// Deslizar la hoja hacia abajo para cerrarla (como en iOS)
+(() => {
+  const sh = $('#sheet');
+  let y0 = null, dy = 0;
+  sh.addEventListener('touchstart', e => {
+    if (sh.scrollTop > 0 || e.target.closest('input, select, textarea')) { y0 = null; return; }
+    y0 = e.touches[0].clientY; dy = 0;
+  }, { passive: true });
+  sh.addEventListener('touchmove', e => {
+    if (y0 === null) return;
+    dy = e.touches[0].clientY - y0;
+    if (dy > 0) { sh.classList.add('dragging'); sh.style.transform = `translateY(${dy}px)`; }
+  }, { passive: true });
+  sh.addEventListener('touchend', () => {
+    if (y0 === null) return;
+    sh.classList.remove('dragging');
+    if (dy > 90) closeSheet(); else sh.style.transform = '';
+    y0 = null; dy = 0;
+  });
+})();
 
 $('#app').addEventListener('click', e => {
   const t = e.target.closest('[data-edit],[data-acc],[data-card],[data-debt],[data-cat],[data-month],[data-act],[data-unlearn],[data-filter]');

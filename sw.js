@@ -1,6 +1,6 @@
 // Sube la versión cada vez que cambies archivos, para que el iPhone baje lo nuevo.
-const VERSION = 'finanzas-v4';
-const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
+const VERSION = 'finanzas-v5';
+const FILES = ['./', 'index.html', 'styles.css', 'charts.js', 'app.js', 'manifest.webmanifest', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(FILES)).then(() => self.skipWaiting()));
