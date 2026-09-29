@@ -117,7 +117,7 @@ const CONNECTORS = new Set(['con', 'en', 'por', 'de', 'del', 'a', 'al', 'desde',
 const RX_INCOME = /(^|\s)(sueldo|salario|quincena|cobre|me pagaron|me pago|me yapearon|me yapeo|te yapearon|te yapeo|me plinearon|recibi|recibiste|te enviaron|te envio|me enviaron|me depositaron|me devolvieron|devolucion|propina|vendi|ingreso)(\s|$)/;
 const RX_TRANSFER = /(^|\s)(pase|transferi|transferencia|movi|retire|retiro|deposite)(\s|$)/;
 const RX_SAVE = /(^|\s)(ahorre|guarde|separe)(\s|$)/;
-const RX_PAY = /(^|\s)(pague|pago|abone|abono|cuota)(\s|$)/;
+const RX_PAY = /(^|\s)(pague|pago|abone|abono|cuota|devolvi|le devolvi)(\s|$)/;
 
 function findAccounts(n) {
   const hits = [];
@@ -397,13 +397,15 @@ function dayLabel(d) {
 }
 
 /* ============ Estado de la vista ============ */
-const V = { tab: 'inicio', month: monthKey(today()), text: '', over: {}, search: '' };
+const V = { tab: 'inicio', month: monthKey(today()), text: '', over: {}, search: '', mode: 'gasto', filter: 'todo' };
 let lastSaved = null;
 
 function draft() {
   const p = parse(V.text);
   if (!p) return null;
   const d = { ...p, ...V.over };
+  // En modo Ingreso, lo que el lector tomó por gasto es un ingreso
+  if (V.mode === 'ingreso' && !V.over.type && p.type === 'gasto') d.type = 'ingreso';
   if (d.type === 'gasto' || d.type === 'ingreso') {
     if (!cat(d.categoryId) || cat(d.categoryId).kind !== d.type) d.categoryId = findCategory(p.keys, d.type) || (d.type === 'ingreso' ? 'otros_ing' : 'otros');
   }
@@ -450,14 +452,16 @@ function txLine(t) {
 }
 
 function viewComposer() {
+  const inc = V.mode === 'ingreso';
   return `<div class="card composer">
-    <textarea id="q" rows="1" placeholder="¿Qué gastaste? Ej: almuerzo 18 yape" autocomplete="off" autocapitalize="sentences">${esc(V.text)}</textarea>
+    <div class="seg" style="margin:-4px -6px 12px"><button data-mode="gasto" class="${inc ? '' : 'on'}">↓ Gasto</button><button data-mode="ingreso" class="${inc ? 'on' : ''}">↑ Ingreso</button></div>
+    <textarea id="q" rows="1" placeholder="${inc ? '¿Cuánto te entró? Ej: sueldo 1500 interbank' : '¿Qué gastaste? Ej: almuerzo 18 yape'}" autocomplete="off" autocapitalize="sentences">${esc(V.text)}</textarea>
     <div id="preview">${previewHTML()}</div>
     <div class="row">
       <button class="btn" id="paste" title="Pegar notificación">📋 Pegar</button>
       <button class="btn primary" id="saveq" style="flex:1" ${draft()?.amount ? '' : 'disabled'}>Guardar</button>
     </div>
-    ${V.text ? '' : '<div class="hint">Escribe como hablas: «taxi 12 efectivo», «ayer super 85 débito», «+2500 sueldo bcp», «pasé 100 de yape a efectivo». También puedes pegar la notificación de Yape o del banco, o dictar con el micrófono del teclado.</div>'}
+    ${V.text ? '' : inc ? '<div class="hint">Ejemplos: «sueldo 1500 interbank», «me yapearon 50 por la clase», «venta 80 efectivo», «cachuelo 200 yape». También puedes pegar la notificación de «Te yapearon».</div>' : '<div class="hint">Escribe como hablas: «taxi 12 efectivo», «ayer super 85 débito», «+2500 sueldo bcp», «pasé 100 de yape a efectivo». También puedes pegar la notificación de Yape o del banco, o dictar con el micrófono del teclado.</div>'}
   </div>`;
 }
 
@@ -513,6 +517,9 @@ function bindComposer() {
     if (b) pickForDraft(b.dataset.pick);
   });
   $('#saveq').addEventListener('click', saveDraft);
+  $$('.composer [data-mode]').forEach(b => b.addEventListener('click', () => {
+    V.mode = b.dataset.mode; delete V.over.type; render(); $('#q').focus();
+  }));
   $('#paste').addEventListener('click', async () => {
     try {
       const t = await navigator.clipboard.readText();
@@ -578,6 +585,10 @@ function viewInicio() {
   const cardDebt = S.accounts.filter(a => a.type === 'credito').reduce((x, a) => x + Math.max(0, -(b[a.id] || 0)), 0);
   const otherDebt = S.debts.reduce((x, d) => x + debtRemaining(d), 0);
   const cats = Object.entries(s.byCat).sort((x, y) => y[1] - x[1]);
+  const incCats = {};
+  allTx().forEach(t => { if (t.type === 'ingreso' && t.date.startsWith(V.month)) incCats[t.categoryId] = (incCats[t.categoryId] || 0) + t.amount; });
+  const incList = Object.entries(incCats).sort((x, y) => y[1] - x[1]);
+  const debtAlerts = S.debts.filter(d => d.due && debtRemaining(d) > 0 && (parseDate(d.due) - parseDate(today())) / 864e5 <= 10);
   const max = cats[0]?.[1] || 1;
   const recent = allTx().filter(t => t.date.startsWith(V.month)).sort(byNewest).slice(0, 6);
   const cardAlerts = S.accounts.filter(isCardReady).map(c => ({ c, due: cardInfo(c).due })).filter(x => x.due);
@@ -591,6 +602,11 @@ function viewInicio() {
     const soon = due.overdue || (parseDate(due.date) - parseDate(today())) / 864e5 <= 3;
     return `<button class="banner" data-card="${c.id}" style="width:100%;border:0;margin-top:10px;text-align:left${soon ? ';background:color-mix(in srgb, var(--gasto) 18%, transparent)' : ''}">
       <span>💳 <b>${esc(c.name)}</b>: paga ${money(due.amount)} ${due.overdue ? '— venció el' : 'hasta el'} ${fmtShort(due.date)}</span><span class="linkbtn">Ver</span></button>`;
+  }).join('')}
+  ${debtAlerts.map(d => {
+    const late = d.due < today();
+    return `<button class="banner" data-debt="${d.id}" style="width:100%;border:0;margin-top:10px;text-align:left${late || (parseDate(d.due) - parseDate(today())) / 864e5 <= 3 ? ';background:color-mix(in srgb, var(--gasto) 18%, transparent)' : ''}">
+      <span>🧾 <b>${esc(d.name)}</b>: ${money(debtRemaining(d))} ${late ? '— venció el' : 'vence el'} ${fmtShort(d.due)}</span><span class="linkbtn">Ver</span></button>`;
   }).join('')}
 
   <div class="month-nav">
@@ -616,6 +632,11 @@ function viewInicio() {
     <div class="card stat"><div class="label">Debes</div><div class="value num ${cardDebt + otherDebt ? 'gasto' : ''}">${money(cardDebt + otherDebt)}</div></div>
   </div>
 
+  ${incList.length ? `<h2>De dónde vino</h2>
+  <div class="card">
+    ${incList.map(([id, v]) => `<div class="catrow"><span>${cat(id)?.icon || '•'}</span><span>${esc(cat(id)?.name || 'Sin categoría')}</span><span class="num ingreso">${money(v)}</span><div class="bar"><i style="width:${(v / incList[0][1]) * 100}%;background:var(--ingreso)"></i></div></div>`).join('')}
+  </div>` : ''}
+
   <h2>En qué se fue</h2>
   <div class="card">
     ${cats.length ? cats.map(([id, v]) => `<div class="catrow"><span>${cat(id)?.icon || '•'}</span><span>${esc(cat(id)?.name || 'Sin categoría')}</span><span class="num">${money(v)}</span><div class="bar"><i style="width:${(v / max) * 100}%"></i></div></div>`).join('') : '<div class="empty">Sin gastos este mes</div>'}
@@ -631,6 +652,11 @@ const byNewest = (a, b) => b.date.localeCompare(a.date) || b.created - a.created
 function viewMovs() {
   const q = norm(V.search.trim());
   let list = allTx().filter(t => t.date.startsWith(V.month));
+  const inc = list.filter(t => t.type === 'ingreso').reduce((x, t) => x + t.amount, 0);
+  const exp = list.filter(t => t.type === 'gasto').reduce((x, t) => x + t.amount, 0);
+  if (V.filter === 'gasto') list = list.filter(t => t.type === 'gasto');
+  if (V.filter === 'ingreso') list = list.filter(t => t.type === 'ingreso');
+  if (V.filter === 'otros') list = list.filter(t => t.type === 'transferencia' || t.type === 'pago_deuda');
   if (q) list = list.filter(t => norm([t.note, cat(t.categoryId)?.name, acc(t.accountId)?.name, acc(t.toAccountId)?.name, debt(t.debtId)?.name].join(' ')).includes(q));
   list.sort(byNewest);
   const groups = {};
@@ -643,6 +669,8 @@ function viewMovs() {
     <strong>${monthLabel(V.month)}</strong>
     <button data-month="1" aria-label="Mes siguiente">›</button>
   </div>
+  <div class="seg">${[['todo', 'Todo'], ['gasto', 'Gastos'], ['ingreso', 'Ingresos'], ['otros', 'Pagos y mov.']].map(([k, l]) => `<button data-filter="${k}" class="${V.filter === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+  ${V.filter === 'ingreso' ? `<div class="muted small" style="margin:0 4px">Entró ${money(inc)} este mes</div>` : V.filter === 'gasto' ? `<div class="muted small" style="margin:0 4px">Salió ${money(exp)} este mes</div>` : ''}
   ${list.length ? Object.entries(groups).map(([d, ts]) => `<div class="day">${esc(dayLabel(d))}</div><div class="list">${ts.map(txLine).join('')}</div>`).join('') : '<div class="card empty">Nada por aquí</div>'}
   `;
 }
@@ -673,7 +701,7 @@ function viewCuentas() {
   ${S.debts.length ? `<div class="list">${S.debts.map(d => {
       const rem = debtRemaining(d), pct = d.total ? Math.round(((d.total - rem) / d.total) * 100) : 0;
       return `<button class="item" data-debt="${d.id}"><span class="ico">🧾</span>
-        <span class="main"><div class="title">${esc(d.name)}</div><div class="sub">Pagado ${pct}% de ${money(d.total)}</div><div class="bar"><i style="width:${pct}%"></i></div></span>
+        <span class="main"><div class="title">${esc(d.name)}</div><div class="sub">${esc([d.due && rem ? (d.due < today() ? 'Venció el ' : 'Vence el ') + fmtShort(d.due) : '', d.note, pct ? `pagado ${pct}%` : ''].filter(Boolean).join(' · ') || 'Sin pagos aún')}</div><div class="bar"><i style="width:${pct}%"></i></div></span>
         <span class="num ${rem ? 'gasto' : 'ingreso'}">${rem ? money(rem) : 'Pagada'}</span></button>`;
     }).join('')}</div>` : '<div class="card empty small">Préstamos, cuotas o lo que le debas a alguien. La tarjeta de crédito se calcula sola arriba.</div>'}
   <button class="linkbtn" data-act="new-debt" style="margin:8px 4px">+ Agregar deuda</button>
@@ -1015,6 +1043,8 @@ function editDebt(id) {
     <label class="field"><span>A quién o qué (ej: Préstamo Tío, Cuotas laptop)</span><input id="d-name" value="${esc(d.name)}"></label>
     <label class="field"><span>Monto total de la deuda (S/)</span><input id="d-total" inputmode="decimal" value="${d.total ? (d.total / 100).toFixed(2) : ''}"></label>
     <label class="field"><span>Ya pagado antes de usar la app (S/)</span><input id="d-paid" inputmode="decimal" value="${d.paidBefore ? (d.paidBefore / 100).toFixed(2) : ''}"></label>
+    <label class="field"><span>Fecha en que vence (opcional)</span><input id="d-due" type="date" value="${d.due || ''}"></label>
+    <label class="field"><span>Nota (opcional)</span><input id="d-note" value="${esc(d.note || '')}" placeholder="Ej: se cobra solo de Yape"></label>
     <div class="actions">${isNew ? '' : '<button class="btn danger" id="d-del">Eliminar</button>'}<button class="btn" id="d-save">Guardar</button></div>`, sh => {
     sh.onclick = e => {
       if (e.target.id === 'p-save') {
@@ -1031,7 +1061,7 @@ function editDebt(id) {
       if (e.target.id === 'd-save') {
         const name = $('#d-name').value.trim(), total = toCents($('#d-total').value);
         if (!name || !total) return toast('Falta nombre o monto');
-        Object.assign(d, { name, total, paidBefore: toCents($('#d-paid').value) || 0 });
+        Object.assign(d, { name, total, paidBefore: toCents($('#d-paid').value) || 0, due: $('#d-due').value || null, note: $('#d-note').value.trim() });
         if (isNew) S.debts.push(d);
         save(); closeSheet(); render();
       }
@@ -1117,11 +1147,12 @@ $('#tabs').addEventListener('click', e => {
 $('#backdrop').addEventListener('click', closeSheet);
 
 $('#app').addEventListener('click', e => {
-  const t = e.target.closest('[data-edit],[data-acc],[data-card],[data-debt],[data-cat],[data-month],[data-act],[data-unlearn]');
+  const t = e.target.closest('[data-edit],[data-acc],[data-card],[data-debt],[data-cat],[data-month],[data-act],[data-unlearn],[data-filter]');
   if (!t) return;
   const ds = t.dataset;
   if (ds.edit) editTx(ds.edit);
   else if (ds.card) cardSheet(ds.card);
+  else if (ds.filter) { V.filter = ds.filter; render(); }
   else if (ds.acc) editAccount(ds.acc);
   else if (ds.debt) editDebt(ds.debt);
   else if (ds.cat) editCategory(ds.cat);
