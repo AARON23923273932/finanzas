@@ -524,6 +524,7 @@ function bindComposer() {
     try {
       const t = await navigator.clipboard.readText();
       if (!t.trim()) return toast('El portapapeles está vacío');
+      if (looksLikeBackup(t)) { importText(t); return; }
       V.text = t.trim(); V.over = {};
       render();
     } catch {
@@ -742,8 +743,9 @@ function viewAjustes() {
     <p class="small muted">Último respaldo: ${S.settings.lastBackup ? esc(dayLabel(S.settings.lastBackup)) : 'nunca'}</p>
     <div class="actions">
       <button class="btn primary" data-act="backup">Exportar</button>
-      <label class="btn" style="text-align:center">Importar<input type="file" id="import" accept="application/json,.json" hidden></label>
+      <label class="btn" style="text-align:center">Importar archivo<input type="file" id="import" accept="application/json,.json" hidden></label>
     </div>
+    <button class="btn block" data-act="paste-backup" style="margin-top:8px">📋 Pegar respaldo como texto</button>
   </div>
   <button class="btn danger block" data-act="reset" style="margin-top:24px">Borrar todos los datos</button>
   <p class="small muted" style="text-align:center">${S.tx.length} movimientos guardados</p>
@@ -1117,14 +1119,32 @@ async function exportData() {
   done();
 }
 
-async function importData(file) {
+const looksLikeBackup = t => /^\s*\{/.test(t) && /"accounts"\s*:/.test(t) && /"tx"\s*:/.test(t);
+
+function importText(text) {
   try {
-    const data = JSON.parse(await file.text());
+    const data = JSON.parse(String(text).trim());
     if (!Array.isArray(data.tx) || !Array.isArray(data.accounts)) throw new Error('No parece un respaldo de esta app');
-    if (!confirm(`Esto reemplaza lo que hay ahora (${S.tx.length} movimientos) por el respaldo (${data.tx.length} movimientos). ¿Seguir?`)) return;
+    if (!confirm(`Esto reemplaza lo que hay ahora (${S.tx.length} movimientos) por el respaldo (${data.accounts.length} cuentas, ${(data.debts || []).length} deudas, ${data.tx.length} movimientos). ¿Seguir?`)) return false;
     S = { ...defaults(), ...data, settings: { ...defaults().settings, ...data.settings } };
-    save(); render(); toast('Respaldo importado');
-  } catch (e) { toast('No se pudo importar: ' + e.message); }
+    save(); closeSheet(); V.tab = 'inicio'; V.text = ''; V.over = {}; render(); toast('Datos importados');
+    return true;
+  } catch (e) { toast('No se pudo importar: ' + e.message); return false; }
+}
+
+async function importData(file) {
+  try { importText(await file.text()); }
+  catch (e) { toast('No se pudo leer el archivo: ' + e.message); }
+}
+
+function pasteBackupSheet() {
+  openSheet(`<h3>Pegar respaldo</h3>
+    <p class="small muted" style="margin-top:-6px">Pega aquí el texto del respaldo (empieza con <code>{</code>).</p>
+    <label class="field"><textarea id="bk-text" rows="8" autocorrect="off" autocapitalize="off" spellcheck="false" style="font:13px ui-monospace,Menlo,monospace"></textarea></label>
+    <button class="btn primary block" id="bk-go">Importar</button>`, sh => {
+    navigator.clipboard?.readText?.().then(t => { if (looksLikeBackup(t) && !$('#bk-text').value) $('#bk-text').value = t; }).catch(() => {});
+    sh.onclick = e => { if (e.target.id === 'bk-go') importText($('#bk-text').value); };
+  });
 }
 
 /* ============ Toast ============ */
@@ -1162,6 +1182,7 @@ $('#app').addEventListener('click', e => {
   else if (ds.act === 'new-debt') editDebt();
   else if (ds.act === 'new-cat') editCategory();
   else if (ds.act === 'backup') exportData();
+  else if (ds.act === 'paste-backup') pasteBackupSheet();
   else if (ds.act === 'reset') {
     if (confirm('¿Borrar TODOS los movimientos, cuentas y deudas? Haz un respaldo antes.') && confirm('¿Seguro? No se puede deshacer.')) {
       S = defaults(); save(); render();
