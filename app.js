@@ -51,7 +51,7 @@ const DEFAULT_ACCOUNTS = [
   { id: 'yape', name: 'Yape', type: 'digital', initial: 0, aliases: 'yape, yapee, yapeaste, yapearon, yapeo, yapie, yapeado' },
   { id: 'efectivo', name: 'Efectivo', type: 'efectivo', initial: 0, aliases: 'efectivo, cash, sencillo, en mano' },
   { id: 'debito', name: 'Tarjeta de débito', type: 'banco', initial: 0, aliases: 'debito, tarjeta de debito, cuenta, banco, bcp, interbank, bbva, scotiabank' },
-  { id: 'credito', name: 'Tarjeta de crédito', type: 'credito', initial: 0, aliases: 'credito, tarjeta de credito, tarjeta, visa, mastercard, amex' },
+  { id: 'credito', name: 'CMR', type: 'credito', initial: 0, aliases: 'cmr, credito, tarjeta de credito, tarjeta, visa, mastercard' },
   { id: 'ahorro', name: 'Ahorros', type: 'ahorro', initial: 0, aliases: 'ahorro, ahorros, alcancia' },
 ];
 
@@ -67,6 +67,7 @@ const DEFAULT_CATS = [
   { id: 'ropa', name: 'Ropa y compras', icon: '🛍️', kind: 'gasto', words: 'ropa zapatilla zapato polo pantalon casaca zara saga falabella ripley oechsle amazon aliexpress temu' },
   { id: 'cuidado', name: 'Cuidado personal', icon: '💈', kind: 'gasto', words: 'corte peluqueria barberia gym gimnasio perfume' },
   { id: 'regalos', name: 'Regalos', icon: '🎁', kind: 'gasto', words: 'regalo cumpleanos' },
+  { id: 'intereses', name: 'Intereses y comisiones', icon: '🏦', kind: 'gasto', words: 'interes comision mantenimiento membresia' },
   { id: 'otros', name: 'Otros gastos', icon: '📦', kind: 'gasto', words: '' },
   { id: 'sueldo', name: 'Sueldo', icon: '💼', kind: 'ingreso', words: 'sueldo salario quincena planilla' },
   { id: 'extra', name: 'Ingreso extra', icon: '✨', kind: 'ingreso', words: 'freelance bono propina cachuelo venta vendi' },
@@ -88,7 +89,12 @@ function defaults() {
 function load() {
   try {
     const s = JSON.parse(localStorage.getItem(KEY));
-    if (s && Array.isArray(s.tx)) return { ...defaults(), ...s, settings: { ...defaults().settings, ...s.settings } };
+    if (s && Array.isArray(s.tx)) {
+      const d = defaults();
+      // categorías nuevas de versiones posteriores
+      for (const c of d.categories) if (!s.categories.some(x => x.id === c.id)) s.categories.splice(s.categories.length - 3, 0, c);
+      return { ...d, ...s, settings: { ...d.settings, ...s.settings } };
+    }
   } catch (e) { /* datos corruptos: arranca limpio */ }
   return defaults();
 }
@@ -179,8 +185,15 @@ function extractNote(text, accWords, amtRaw) {
 }
 
 function parse(raw) {
-  const text = String(raw || '').trim();
+  let text = String(raw || '').trim();
   if (!text) return null;
+  // «12 cuotas», «en 6 cuotas», «sin intereses» se leen aparte para no confundirlos con el monto
+  let cuotas = 1, sinInteres = false;
+  const mc = text.match(/(?:\b(?:en|a)\s+)?(\d{1,2})\s*cuotas?\b/i);
+  if (mc) { cuotas = Math.max(1, Math.min(60, Number(mc[1]))); text = text.replace(mc[0], ' '); }
+  const ms = text.match(/sin\s+inter[eé]s(?:es)?/i);
+  if (ms) { sinInteres = true; text = text.replace(ms[0], ' '); }
+  text = text.replace(/\s+/g, ' ').trim();
   const n = norm(text).replace(/[^a-z0-9ñ\s]/g, ' ').replace(/\s+/g, ' ').trim();
 
   // Monto: primero "S/ 18.50", luego "18 soles", luego el primer número suelto (evita fechas, horas y tarjetas)
@@ -241,6 +254,10 @@ function parse(raw) {
   if (type === 'transferencia' && toAccountId === accountId) {
     accountId = S.accounts.find(a => a.id !== toAccountId && a.type !== 'credito')?.id;
   }
+  if (type === 'gasto' && cuotas > 1 && acc(accountId)?.type !== 'credito' && !accs.ids.length) {
+    const cc = S.accounts.find(a => a.type === 'credito');
+    if (cc) accountId = cc.id;
+  }
   if ((type === 'gasto' || type === 'ingreso') && !categoryId) categoryId = type === 'ingreso' ? 'otros_ing' : 'otros';
 
   let date = today();
@@ -250,23 +267,105 @@ function parse(raw) {
   let note = extractNote(text, accs.words, amtRaw);
   if (type === 'transferencia' && !note.includes(' ')) note = ''; // «Pasé», «Retiré» no aportan nada
   const keys = [...new Set(tokens.filter(t => t.length >= 3 && !/^\d/.test(t)))].slice(0, 4);
-  return { type, amount, categoryId, accountId, toAccountId, debtId, date, note, keys };
+  return { type, amount, categoryId, accountId, toAccountId, debtId, date, note, keys, cuotas, sinInteres };
 }
 
 /* ============ Cálculos ============ */
+// Una tarjeta configurada guarda «lo que debes hoy» como foto; lo registrado antes de esa foto ya está incluido
+const counts = (accountId, t) => { const a = acc(accountId); return t.virtual || !a || !a.setupAt || (t.created || 0) > a.setupAt; };
+
 function balances() {
   const b = {};
   S.accounts.forEach(a => { b[a.id] = a.initial || 0; });
-  for (const t of S.tx) {
-    if (t.type === 'gasto' || t.type === 'pago_deuda') b[t.accountId] = (b[t.accountId] || 0) - t.amount;
-    else if (t.type === 'ingreso') b[t.accountId] = (b[t.accountId] || 0) + t.amount;
-    else if (t.type === 'transferencia') {
-      b[t.accountId] = (b[t.accountId] || 0) - t.amount;
-      b[t.toAccountId] = (b[t.toAccountId] || 0) + t.amount;
-    }
+  const mv = (id, t, v) => { if (counts(id, t)) b[id] = (b[id] || 0) + v; };
+  for (const t of allTx()) {
+    if (t.type === 'gasto' || t.type === 'pago_deuda') mv(t.accountId, t, -t.amount);
+    else if (t.type === 'ingreso') mv(t.accountId, t, t.amount);
+    else if (t.type === 'transferencia') { mv(t.accountId, t, -t.amount); mv(t.toAccountId, t, t.amount); }
   }
   return b;
 }
+
+/* ============ Tarjetas de crédito ============ */
+const fmtShort = iso => { const d = parseDate(iso); return d.toLocaleDateString('es-PE', { day: 'numeric', month: 'short' }).replace(/\.$/, '') + (d.getFullYear() !== new Date().getFullYear() ? ' ' + d.getFullYear() : ''); };
+const dayIn = (y, m, day) => new Date(y, m, Math.min(day, new Date(y, m + 1, 0).getDate()));
+const isCardReady = a => !!(a && a.type === 'credito' && a.closeDay && a.payDay);
+// Cierre (facturación) en el que cae algo comprado en `iso`
+function closeFor(card, iso) {
+  const d = parseDate(iso);
+  let c = dayIn(d.getFullYear(), d.getMonth(), card.closeDay);
+  if (c < d) c = dayIn(d.getFullYear(), d.getMonth() + 1, card.closeDay);
+  return isoDate(c);
+}
+const closeAdd = (card, iso, k) => { const d = parseDate(iso); return isoDate(dayIn(d.getFullYear(), d.getMonth() + k, card.closeDay)); };
+const dueFor = (card, closeIso) => { const d = parseDate(closeIso); return isoDate(dayIn(d.getFullYear(), d.getMonth() + (card.payDay > card.closeDay ? 0 : 1), card.payDay)); };
+function nextDue(card, iso) {
+  const d = parseDate(iso);
+  let p = dayIn(d.getFullYear(), d.getMonth(), card.payDay);
+  if (p < d) p = dayIn(d.getFullYear(), d.getMonth() + 1, card.payDay);
+  return isoDate(p);
+}
+
+// Cuota fija (método francés) con la TEA convertida a tasa mensual
+function cuotaSchedule(amount, n, tea) {
+  const i = tea > 0 ? Math.pow(1 + tea / 100, 1 / 12) - 1 : 0;
+  const fixed = i ? amount * i / (1 - Math.pow(1 + i, -n)) : amount / n;
+  const rows = [];
+  let bal = amount;
+  for (let k = 1; k <= n; k++) {
+    const interest = Math.round(bal * i);
+    const capital = k === n ? bal : Math.round(fixed) - interest;
+    bal -= capital;
+    rows.push({ k, capital, interest, amount: capital + interest });
+  }
+  return rows;
+}
+
+function cardInfo(card) {
+  if (!isCardReady(card)) return null;
+  const setup = card.setupAt ? isoDate(new Date(card.setupAt)) : '2000-01-01';
+  const t0 = today();
+  const bills = {};
+  const add = (close, v) => { bills[close] = (bills[close] || 0) + v; };
+  const interest = [], plans = [];
+  const first = closeFor(card, setup);
+  add(closeFor(card, t0), 0); // el ciclo abierto siempre existe
+  if (card.unbilled) add(first, card.unbilled);
+  for (const p of card.plans || []) {
+    let billed = 0;
+    for (let j = 0; j < p.remaining; j++) { const c = closeAdd(card, first, j); add(c, p.cuota); if (c < t0) billed++; }
+    if (billed < p.remaining) plans.push({ label: p.desc || 'Compra anterior', cuota: p.cuota, left: p.remaining - billed, of: null, end: closeAdd(card, first, p.remaining - 1) });
+  }
+  let paid = 0;
+  for (const t of S.tx) {
+    if (!counts(card.id, t)) continue;
+    if (t.type === 'gasto' && t.accountId === card.id) {
+      const n = t.cuotas || 1, c0 = closeFor(card, t.date);
+      if (n === 1) { add(c0, t.amount); continue; }
+      const rows = cuotaSchedule(t.amount, n, t.tea ?? card.tea ?? 0);
+      let billed = 0;
+      rows.forEach((r, k) => {
+        const c = closeAdd(card, c0, k);
+        add(c, r.amount);
+        if (c < t0) billed++;
+        if (r.interest && c <= t0) interest.push({ id: `int-${t.id}-${r.k}`, virtual: true, type: 'gasto', categoryId: 'intereses', accountId: card.id, amount: r.interest, date: c, created: 0, note: `Interés cuota ${r.k}/${n}${t.note ? ' · ' + t.note : ''}` });
+      });
+      if (billed < n) plans.push({ label: t.note || cat(t.categoryId)?.name || 'Compra', cuota: rows[0].amount, left: n - billed, of: n, end: closeAdd(card, c0, n - 1) });
+    } else if (t.type === 'transferencia' && t.accountId === card.id) add(closeFor(card, t.date), t.amount);
+    else if ((t.type === 'transferencia' && t.toAccountId === card.id) || (t.type === 'ingreso' && t.accountId === card.id)) paid += t.amount;
+  }
+  // Estados de cuenta en orden; cada pago cubre primero el más antiguo
+  const statements = [{ close: null, due: nextDue(card, setup), amount: card.statement0 || 0 }]
+    .concat(Object.keys(bills).sort().map(c => ({ close: c, due: dueFor(card, c), amount: bills[c] })));
+  let pool = paid;
+  for (const s of statements) { const use = Math.min(pool, s.amount); s.left = s.amount - use; pool -= use; }
+  const closed = statements.filter(s => (s.close === null || s.close < t0) && s.left > 0);
+  const due = closed.length ? { amount: closed.reduce((x, s) => x + s.left, 0), date: closed[0].due, overdue: closed[0].due < t0 } : null;
+  const next = statements.find(s => s.close && s.close >= t0);
+  return { statements, due, next, interest, plans, credit: pool };
+}
+const cardInterest = () => S.accounts.filter(isCardReady).flatMap(c => cardInfo(c).interest);
+const allTx = () => S.tx.concat(cardInterest());
 function debtRemaining(d) {
   const paid = S.tx.filter(t => t.type === 'pago_deuda' && t.debtId === d.id).reduce((s, t) => s + t.amount, 0);
   return Math.max(0, d.total - (d.paidBefore || 0) - paid);
@@ -274,7 +373,7 @@ function debtRemaining(d) {
 function summary(month) {
   let inc = 0, exp = 0, debtPay = 0, saved = 0;
   const byCat = {};
-  for (const t of S.tx) {
+  for (const t of allTx()) {
     if (!t.date.startsWith(month)) continue;
     if (t.type === 'ingreso') inc += t.amount;
     else if (t.type === 'gasto') { exp += t.amount; byCat[t.categoryId] = (byCat[t.categoryId] || 0) + t.amount; }
@@ -310,6 +409,10 @@ function draft() {
   }
   if (d.type === 'transferencia' && !acc(d.toAccountId)) d.toAccountId = S.accounts.find(a => a.id !== d.accountId)?.id;
   if (d.type === 'pago_deuda' && !debt(d.debtId)) d.debtId = S.debts[0]?.id || null;
+  d.cuotas = Number(d.cuotas) || 1;
+  d.onCard = d.type === 'gasto' && acc(d.accountId)?.type === 'credito';
+  if (!d.onCard) d.cuotas = 1;
+  d.tea = d.sinInteres ? 0 : (acc(d.accountId)?.tea || 0);
   return d;
 }
 
@@ -337,8 +440,9 @@ function txLine(t) {
   } else {
     if (t.note && c) sub.push(c.name);
     sub.push(a?.name || '?');
+    if (t.cuotas > 1) sub.push(`${t.cuotas} cuotas`);
   }
-  return `<button class="item" data-edit="${t.id}">
+  return `<button class="item" ${t.virtual ? `data-card="${t.accountId}"` : `data-edit="${t.id}"`}>
     <span class="ico">${icon}</span>
     <span class="main"><div class="title">${esc(title)}</div><div class="sub">${esc(sub.join(' · '))}</div></span>
     <span class="num ${cls}">${sign}${money(t.amount)}</span>
@@ -366,6 +470,11 @@ function previewHTML() {
   if (d.type === 'pago_deuda') chips.push(`<button class="chip" data-pick="debtId">🧾 ${esc(debt(d.debtId)?.name || 'Elige deuda')}</button>`);
   chips.push(`<button class="chip" data-pick="accountId">${ACC_ICON[a?.type] || ''} ${d.type === 'transferencia' ? 'De ' : ''}${esc(a?.name || 'Cuenta')}</button>`);
   if (d.type === 'transferencia') { const ta = acc(d.toAccountId); chips.push(`<button class="chip" data-pick="toAccountId">${ACC_ICON[ta?.type] || ''} A ${esc(ta?.name || 'Cuenta')}</button>`); }
+  if (d.onCard) {
+    const cuota = d.amount && d.cuotas > 1 ? ` · ${money(cuotaSchedule(d.amount, d.cuotas, d.tea)[0].amount)}/mes` : '';
+    chips.push(`<button class="chip" data-pick="cuotas">📆 ${d.cuotas === 1 ? '1 cuota' : d.cuotas + ' cuotas'}${cuota}</button>`);
+    if (d.cuotas > 1) chips.push(`<button class="chip ${d.sinInteres ? 'on' : ''}" data-pick="sinInteres">${d.sinInteres ? 'Sin intereses' : `TEA ${d.tea}%`}</button>`);
+  }
   chips.push(`<label class="chip">📅 ${esc(dayLabel(d.date))}<input type="date" id="pdate" value="${d.date}"></label>`);
   return `<div class="preview">
     <div class="amount-line"><span class="muted">S/</span><input id="pamt" inputmode="decimal" placeholder="0.00" value="${d.amount ? (d.amount / 100).toFixed(2) : ''}"></div>
@@ -419,6 +528,12 @@ function bindComposer() {
 
 function pickForDraft(field) {
   const d = draft();
+  if (field === 'sinInteres') { V.over.sinInteres = !d.sinInteres; refreshPreview(); return; }
+  if (field === 'cuotas') {
+    picker('Cuotas', [1, 2, 3, 4, 6, 9, 12, 18, 24, 36].map(k => ({ value: String(k), label: k === 1 ? '1 cuota (sin intereses)' : `${k} cuotas${d.amount ? ' · ' + money(cuotaSchedule(d.amount, k, d.tea)[0].amount) + '/mes' : ''}` })),
+      String(d.cuotas), v => { V.over.cuotas = Number(v); refreshPreview(); });
+    return;
+  }
   let opts = [], title = '';
   if (field === 'type') { title = 'Tipo'; opts = Object.entries(TYPES).map(([k, v]) => ({ value: k, label: `${v.icon} ${v.label}` })); }
   if (field === 'categoryId') { title = 'Categoría'; opts = S.categories.filter(c => c.kind === d.type).map(c => ({ value: c.id, label: `${c.icon} ${c.name}` })); }
@@ -439,6 +554,7 @@ function saveDraft() {
   if (d.type === 'gasto' || d.type === 'ingreso') t.categoryId = d.categoryId;
   if (d.type === 'transferencia') t.toAccountId = d.toAccountId;
   if (d.type === 'pago_deuda') t.debtId = d.debtId;
+  if (d.onCard && d.cuotas > 1) { t.cuotas = d.cuotas; t.tea = d.tea; }
   // Aprende: si corregiste la categoría, la próxima vez esas palabras van ahí
   if (V.over.learn && t.categoryId) d.keys.forEach(k => { S.rules[k] = t.categoryId; });
   S.tx.push(t);
@@ -463,13 +579,19 @@ function viewInicio() {
   const otherDebt = S.debts.reduce((x, d) => x + debtRemaining(d), 0);
   const cats = Object.entries(s.byCat).sort((x, y) => y[1] - x[1]);
   const max = cats[0]?.[1] || 1;
-  const recent = S.tx.filter(t => t.date.startsWith(V.month)).sort(byNewest).slice(0, 6);
+  const recent = allTx().filter(t => t.date.startsWith(V.month)).sort(byNewest).slice(0, 6);
+  const cardAlerts = S.accounts.filter(isCardReady).map(c => ({ c, due: cardInfo(c).due })).filter(x => x.due);
   const needBackup = S.tx.length >= 5 && (!S.settings.lastBackup || (Date.now() - parseDate(S.settings.lastBackup)) / 864e5 > 14);
 
   return `
   <h1>Finanzas</h1>
   ${needBackup ? `<div class="banner"><span>Tus datos viven solo en este iPhone. Haz un respaldo.</span><button class="linkbtn" data-act="backup">Respaldar</button></div>` : ''}
   ${viewComposer()}
+  ${cardAlerts.map(({ c, due }) => {
+    const soon = due.overdue || (parseDate(due.date) - parseDate(today())) / 864e5 <= 3;
+    return `<button class="banner" data-card="${c.id}" style="width:100%;border:0;margin-top:10px;text-align:left${soon ? ';background:color-mix(in srgb, var(--gasto) 18%, transparent)' : ''}">
+      <span>💳 <b>${esc(c.name)}</b>: paga ${money(due.amount)} ${due.overdue ? '— venció el' : 'hasta el'} ${fmtShort(due.date)}</span><span class="linkbtn">Ver</span></button>`;
+  }).join('')}
 
   <div class="month-nav">
     <button data-month="-1" aria-label="Mes anterior">‹</button>
@@ -508,7 +630,7 @@ const byNewest = (a, b) => b.date.localeCompare(a.date) || b.created - a.created
 
 function viewMovs() {
   const q = norm(V.search.trim());
-  let list = S.tx.filter(t => t.date.startsWith(V.month));
+  let list = allTx().filter(t => t.date.startsWith(V.month));
   if (q) list = list.filter(t => norm([t.note, cat(t.categoryId)?.name, acc(t.accountId)?.name, acc(t.toAccountId)?.name, debt(t.debtId)?.name].join(' ')).includes(q));
   list.sort(byNewest);
   const groups = {};
@@ -535,8 +657,13 @@ function viewCuentas() {
       const v = b[a.id] || 0;
       const isCredit = a.type === 'credito';
       const txt = isCredit ? (v < 0 ? `Debes ${money(-v)}` : v > 0 ? `A favor ${money(v)}` : 'Sin deuda') : money(v);
-      return `<button class="item" data-acc="${a.id}"><span class="ico">${ACC_ICON[a.type]}</span>
-        <span class="main"><div class="title">${esc(a.name)}</div><div class="sub">${ACC_TYPES[a.type]}</div></span>
+      let sub = ACC_TYPES[a.type];
+      if (isCredit) {
+        const due = cardInfo(a)?.due;
+        sub = !isCardReady(a) ? 'Toca para poner línea y fechas' : due ? `Pagar ${money(due.amount)} ${due.overdue ? '· vencido' : 'hasta el ' + fmtShort(due.date)}` : 'Al día';
+      }
+      return `<button class="item" ${isCredit ? `data-card="${a.id}"` : `data-acc="${a.id}"`}><span class="ico">${ACC_ICON[a.type]}</span>
+        <span class="main"><div class="title">${esc(a.name)}</div><div class="sub">${esc(sub)}</div></span>
         <span class="num ${(isCredit && v < 0) || v < 0 ? 'gasto' : ''}">${txt}</span></button>`;
     }).join('')}
   </div>
@@ -598,6 +725,7 @@ function viewAjustes() {
 /* ============ Hoja inferior ============ */
 function openSheet(html, onMount) {
   const sh = $('#sheet');
+  sh.onclick = sh.oninput = sh.onchange = null;
   sh.innerHTML = '<div class="grab"></div>' + html;
   sh.hidden = false; $('#backdrop').hidden = false; $('#toast').hidden = true;
   if (onMount) onMount(sh);
@@ -625,6 +753,9 @@ function editTx(id) {
       ${type === 'pago_deuda' ? `<label class="field"><span>Deuda</span><select id="e-debt">${S.debts.map(d => `<option value="${d.id}" ${d.id === t.debtId ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select></label>` : ''}
       <label class="field"><span>${type === 'transferencia' ? 'Desde' : 'Cuenta'}</span><select id="e-acc">${accOpts(t.accountId)}</select></label>
       ${type === 'transferencia' ? `<label class="field"><span>Hacia</span><select id="e-to">${accOpts(t.toAccountId)}</select></label>` : ''}
+      ${type === 'gasto' && S.accounts.some(a => a.type === 'credito') ? `<div class="grid2">
+        <label class="field"><span>Cuotas (solo tarjeta)</span><input id="e-cuotas" inputmode="numeric" value="${t.cuotas || 1}"></label>
+        <label class="field"><span>TEA (%)</span><input id="e-tea" inputmode="decimal" value="${t.tea ?? ''}" placeholder="la de la tarjeta"></label></div>` : ''}
       <label class="field"><span>Fecha</span><input id="e-date" type="date" value="${t.date}"></label>
       <div class="actions"><button class="btn danger" id="e-del">Eliminar</button><button class="btn primary" id="e-save">Guardar</button></div>`, sh => {
       sh.onclick = e => {
@@ -647,6 +778,12 @@ function editTx(id) {
           if (newCat) t.categoryId = newCat;
           if (type === 'transferencia') t.toAccountId = $('#e-to').value;
           if (type === 'pago_deuda') t.debtId = $('#e-debt').value;
+          const card = acc(t.accountId), n = parseInt($('#e-cuotas')?.value, 10) || 1;
+          delete t.cuotas; delete t.tea;
+          if (type === 'gasto' && card?.type === 'credito' && n > 1) {
+            const tea = parseFloat(String($('#e-tea').value).replace(',', '.'));
+            t.cuotas = Math.min(60, n); t.tea = isFinite(tea) ? tea : (card.tea || 0);
+          }
           save(); closeSheet(); render();
         }
       };
@@ -658,35 +795,211 @@ function editTx(id) {
 function editAccount(id) {
   const a = id ? acc(id) : { id: uid(), name: '', type: 'digital', initial: 0, aliases: '' };
   const isNew = !id;
-  let type = a.type;
+  const f = {
+    name: a.name, type: a.type, aliases: a.aliases, initial: a.initial || 0,
+    limit: a.limit || 0, closeDay: a.closeDay || '', payDay: a.payDay || '', tea: a.tea ?? '',
+    statement0: a.statement0 || 0, unbilled: a.unbilled || 0, plans: (a.plans || []).map(p => ({ ...p })),
+  };
+  const cents = v => (v ? (v / 100).toFixed(2) : '');
+  const days = sel => '<option value="">—</option>' + Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}" ${Number(sel) === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('');
+  const read = () => {
+    const sh = $('#sheet'), val = q => $(q, sh)?.value;
+    f.name = val('#a-name') ?? f.name;
+    f.aliases = val('#a-alias') ?? f.aliases;
+    if ($('#a-init', sh)) f.initial = toCents(val('#a-init')) || 0;
+    if ($('#a-limit', sh)) {
+      f.limit = toCents(val('#a-limit')) || 0;
+      f.closeDay = val('#a-close'); f.payDay = val('#a-pay'); f.tea = val('#a-tea');
+      f.statement0 = toCents(val('#a-st0')) || 0; f.unbilled = toCents(val('#a-unb')) || 0;
+      f.plans = $$('.plan-row', sh).map(r => ({ desc: $('.p-desc', r).value.trim(), cuota: toCents($('.p-cuota', r).value) || 0, remaining: Math.max(0, parseInt($('.p-rem', r).value, 10) || 0) }));
+    }
+  };
   const draw = () => {
-    const credit = type === 'credito';
-    const init = credit ? Math.max(0, -a.initial) : a.initial;
-    openSheet(`<h3>${isNew ? 'Nueva cuenta' : 'Editar cuenta'}</h3>
-      <label class="field"><span>Nombre</span><input id="a-name" value="${esc(a.name)}" placeholder="Ej: Plin, BBVA, Tarjeta Oh"></label>
-      <label class="field"><span>Tipo</span><select id="a-type">${Object.entries(ACC_TYPES).map(([k, v]) => `<option value="${k}" ${k === type ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-      <label class="field"><span>${credit ? 'Lo que debías al empezar a usar la app (S/)' : 'Saldo al empezar a usar la app (S/)'}</span><input id="a-init" inputmode="decimal" value="${(init / 100).toFixed(2)}"></label>
-      <label class="field"><span>Palabras que la identifican (separadas por coma)</span><input id="a-alias" value="${esc(a.aliases)}" placeholder="Ej: plin, bbva"></label>
+    const credit = f.type === 'credito';
+    const cardFields = `
+      <label class="field"><span>Línea de crédito (S/)</span><input id="a-limit" inputmode="decimal" value="${cents(f.limit)}"></label>
+      <div class="grid2">
+        <label class="field"><span>Día de cierre (facturación)</span><select id="a-close">${days(f.closeDay)}</select></label>
+        <label class="field"><span>Último día de pago</span><select id="a-pay">${days(f.payDay)}</select></label>
+      </div>
+      <label class="field"><span>TEA de compras en cuotas (%)</span><input id="a-tea" inputmode="decimal" value="${esc(f.tea)}" placeholder="Sale en tu estado de cuenta"></label>
+      <h2 style="margin:20px 0 10px">Lo que debes hoy</h2>
+      <label class="field"><span>Monto a pagar de tu último estado de cuenta (S/)</span><input id="a-st0" inputmode="decimal" value="${cents(f.statement0)}" placeholder="0.00"></label>
+      <label class="field"><span>Compras en 1 cuota hechas después del último cierre (S/)</span><input id="a-unb" inputmode="decimal" value="${cents(f.unbilled)}" placeholder="0.00"></label>
+      <div class="field"><span>Compras en cuotas que ya vienes pagando: la cuota y cuántas faltan después de este estado de cuenta</span>
+        ${f.plans.map((p, i) => `<div class="plan-row" style="display:grid;grid-template-columns:1fr 84px 60px 24px;gap:6px;margin-bottom:6px;align-items:center">
+          <input class="p-desc" placeholder="Qué fue" value="${esc(p.desc)}"><input class="p-cuota" inputmode="decimal" placeholder="Cuota" value="${cents(p.cuota)}"><input class="p-rem" inputmode="numeric" placeholder="Faltan" value="${p.remaining || ''}"><button class="linkbtn" data-rmplan="${i}" aria-label="Quitar">✕</button></div>`).join('')}
+        <button class="linkbtn" id="a-addplan">+ Agregar compra en cuotas</button>
+      </div>`;
+    openSheet(`<h3>${isNew ? 'Nueva cuenta' : credit ? 'Configurar tarjeta' : 'Editar cuenta'}</h3>
+      <label class="field"><span>Nombre</span><input id="a-name" value="${esc(f.name)}" placeholder="${credit ? 'Ej: CMR, Oh!, Visa BCP' : 'Ej: Plin, BBVA'}"></label>
+      <label class="field"><span>Tipo</span><select id="a-type">${Object.entries(ACC_TYPES).map(([k, v]) => `<option value="${k}" ${k === f.type ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+      ${credit ? cardFields : `<label class="field"><span>Saldo al empezar a usar la app (S/)</span><input id="a-init" inputmode="decimal" value="${(f.initial / 100).toFixed(2)}"></label>`}
+      <label class="field"><span>Palabras que la identifican (separadas por coma)</span><input id="a-alias" value="${esc(f.aliases)}" placeholder="Ej: plin, bbva"></label>
       <div class="actions">${isNew ? '' : '<button class="btn danger" id="a-del">Eliminar</button>'}<button class="btn primary" id="a-save">Guardar</button></div>`, sh => {
-      $('#a-type', sh).onchange = e => { a.name = $('#a-name').value; a.aliases = $('#a-alias').value; type = e.target.value; draw(); };
+      $('#a-type', sh).onchange = e => { read(); f.type = e.target.value; draw(); };
       sh.onclick = e => {
+        if (e.target.id === 'a-addplan') { read(); f.plans.push({ desc: '', cuota: 0, remaining: 0 }); draw(); return; }
+        if (e.target.dataset.rmplan) { read(); f.plans.splice(Number(e.target.dataset.rmplan), 1); draw(); return; }
         if (e.target.id === 'a-del') {
           if (S.tx.some(t => t.accountId === a.id || t.toAccountId === a.id)) return toast('Tiene movimientos: bórralos o muévelos primero');
           if (!confirm(`¿Eliminar ${a.name}?`)) return;
           S.accounts = S.accounts.filter(x => x.id !== a.id); save(); closeSheet(); render();
         }
         if (e.target.id === 'a-save') {
-          const name = $('#a-name').value.trim();
+          read();
+          const name = f.name.trim();
           if (!name) return toast('Ponle un nombre');
-          const v = toCents($('#a-init').value) || 0;
-          Object.assign(a, { name, type, aliases: $('#a-alias').value, initial: type === 'credito' ? -v : v });
+          Object.assign(a, { name, type: f.type, aliases: f.aliases });
+          if (f.type === 'credito') {
+            const plans = f.plans.filter(p => p.cuota && p.remaining);
+            // La primera configuración es la foto de partida: lo registrado antes ya está en «lo que debes hoy».
+            // Correcciones posteriores no la mueven, para no perder compras registradas después.
+            if (!a.setupAt) a.setupAt = Date.now();
+            const tea = parseFloat(String(f.tea).replace(',', '.'));
+            Object.assign(a, { limit: f.limit, closeDay: Number(f.closeDay) || null, payDay: Number(f.payDay) || null, tea: isFinite(tea) ? tea : 0, statement0: f.statement0, unbilled: f.unbilled, plans });
+            a.initial = -(f.statement0 + f.unbilled + plans.reduce((x, p) => x + p.cuota * p.remaining, 0));
+          } else {
+            a.initial = f.initial;
+            ['limit', 'closeDay', 'payDay', 'tea', 'statement0', 'unbilled', 'plans', 'setupAt'].forEach(k => delete a[k]);
+          }
           if (isNew) S.accounts.push(a);
           save(); closeSheet(); render();
+          if (f.type === 'credito' && isCardReady(a)) cardSheet(a.id);
         }
       };
     });
   };
   draw();
+}
+
+/* ============ Ficha de la tarjeta, pago y simulador ============ */
+function cardSheet(id) {
+  const c = acc(id), info = cardInfo(c);
+  if (!info) { editAccount(id); toast('Pon la línea, el día de cierre y el día de pago'); return; }
+  const debtNow = Math.max(0, -(balances()[c.id] || 0));
+  const avail = (c.limit || 0) - debtNow;
+  const { due, next } = info;
+  const box = 'class="card" style="background:var(--bg);box-shadow:none;margin-top:10px"';
+  openSheet(`<h3>💳 ${esc(c.name)}</h3>
+    <div class="grid2">
+      <div class="stat"><div class="label">Debes en total</div><div class="value num ${debtNow ? 'gasto' : ''}">${money(debtNow)}</div></div>
+      <div class="stat"><div class="label">Línea disponible</div><div class="value num">${c.limit ? money(avail) : '—'}</div></div>
+    </div>
+    ${c.limit ? `<div class="bar ${avail < c.limit * 0.2 ? 'warn' : ''}"><i style="width:${Math.min(100, (debtNow / c.limit) * 100)}%"></i></div>
+      <div class="muted small" style="margin-top:4px">Usas el ${Math.round((debtNow / c.limit) * 100)}% de tu línea de ${money(c.limit)}</div>` : ''}
+    <div ${box}>
+      <div class="muted small">${due ? (due.overdue ? `Pago vencido desde el ${fmtShort(due.date)}` : `Pagar hasta el ${fmtShort(due.date)}`) : 'Estado de cuenta actual'}</div>
+      <div class="num ${due?.overdue ? 'gasto' : ''}" style="font-size:24px;font-weight:700">${due ? money(due.amount) : 'Al día ✓'}</div>
+    </div>
+    <div ${box}>
+      <div class="muted small">Próximo estado de cuenta · cierra el ${fmtShort(next.close)}, se paga hasta el ${fmtShort(next.due)}</div>
+      <div class="num" style="font-size:20px;font-weight:700">${money(next.left)}</div>
+      <div class="muted small">Sube con lo que compres antes del cierre.</div>
+    </div>
+    ${info.credit ? `<p class="small ingreso">Tienes ${money(info.credit)} pagados por adelantado.</p>` : ''}
+    <h2>Cuotas vigentes</h2>
+    ${info.plans.length ? `<div class="list">${info.plans.map(p => `<div class="item"><span class="ico">📆</span>
+      <span class="main"><div class="title">${esc(p.label)}</div><div class="sub">Faltan ${p.left}${p.of ? ' de ' + p.of : ''} · última el ${fmtShort(dueFor(c, p.end))}</div></span>
+      <span class="num">${money(p.cuota)}</span></div>`).join('')}</div>` : '<div class="muted small">No tienes compras en cuotas.</div>'}
+    <div class="actions" style="margin-top:16px"><button class="btn" id="k-edit">Configurar</button><button class="btn" id="k-sim">Simular cuotas</button></div>
+    <button class="btn primary block" id="k-pay" style="margin-top:8px">Registrar pago</button>`, sh => {
+    sh.onclick = e => {
+      if (e.target.id === 'k-edit') editAccount(id);
+      if (e.target.id === 'k-sim') simulate(id);
+      if (e.target.id === 'k-pay') payCard(id, due?.amount);
+    };
+  });
+}
+
+function payCard(id, suggested) {
+  const c = acc(id);
+  openSheet(`<h3>Pagar ${esc(c.name)}</h3>
+    <label class="field"><span>Monto (S/)</span><input id="k-amt" inputmode="decimal" value="${suggested ? (suggested / 100).toFixed(2) : ''}" placeholder="0.00"></label>
+    <label class="field"><span>Desde</span><select id="k-from">${S.accounts.filter(a => a.type !== 'credito').map(a => `<option value="${a.id}" ${a.id === S.settings.defaultAccount ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
+    <button class="btn primary block" id="k-save">Registrar pago</button>`, sh => {
+    sh.onclick = e => {
+      if (e.target.id !== 'k-save') return;
+      const amount = toCents($('#k-amt').value);
+      if (!amount) return toast('Pon el monto');
+      S.tx.push({ id: uid(), type: 'transferencia', amount, accountId: $('#k-from').value, toAccountId: id, date: today(), note: '', created: Date.now() });
+      save(); render(); cardSheet(id);
+      toast(`Pago de ${money(amount)} a ${c.name} registrado`);
+    };
+  });
+}
+
+function simulate(id) {
+  const c = acc(id), info = cardInfo(c);
+  const st = { amount: '', n: 12, tea: c.tea || 0, free: false };
+  const incomes = [1, 2, 3].map(k => summary(shiftMonth(monthKey(today()), -k)).inc).filter(v => v > 0);
+  const avgIncome = incomes.length ? incomes.reduce((x, y) => x + y, 0) / incomes.length : 0;
+  const results = () => {
+    const P = toCents(st.amount);
+    if (!P) return '<p class="muted small">Pon el precio para ver las cuotas.</p>';
+    const n = Math.max(1, Math.min(60, parseInt(st.n, 10) || 1));
+    const tea = st.free ? 0 : parseFloat(String(st.tea).replace(',', '.')) || 0;
+    const rows = cuotaSchedule(P, n, tea), total = rows.reduce((x, r) => x + r.amount, 0);
+    const c0 = closeFor(c, today()), debtNow = Math.max(0, -(balances()[c.id] || 0));
+    const bill = cl => info.statements.find(s => s.close === cl)?.left || 0;
+    const proj = rows.slice(0, 12).map((r, k) => { const cl = closeAdd(c, c0, k), before = bill(cl); return { due: dueFor(c, cl), before, after: before + r.amount }; });
+    const pct = avgIncome ? Math.round((rows[0].amount / avgIncome) * 100) : null;
+    return `
+      <div class="grid2" style="margin-top:4px">
+        <div class="stat"><div class="label">Cuota mensual</div><div class="value num">${money(rows[0].amount)}</div></div>
+        <div class="stat"><div class="label">Total a pagar</div><div class="value num">${money(total)}</div></div>
+      </div>
+      <p class="small ${total > P ? 'gasto' : 'ingreso'}">${total > P ? `Pagarías ${money(total - P)} de intereses: ${Math.round(((total - P) / P) * 100)}% más que al contado.` : 'Sin intereses: pagas lo mismo que al contado.'}</p>
+      <p class="small muted">La primera cuota llega en el estado de cuenta que cierra el ${fmtShort(c0)} y la pagas hasta el ${fmtShort(dueFor(c, c0))}. Terminas de pagar el ${fmtShort(dueFor(c, closeAdd(c, c0, n - 1)))}.</p>
+      ${c.limit ? `<p class="small ${debtNow + P > c.limit ? 'gasto' : 'muted'}">${debtNow + P > c.limit ? `No te alcanza la línea: tienes ${money(c.limit - debtNow)} disponibles.` : `Tu línea disponible bajaría de ${money(c.limit - debtNow)} a ${money(c.limit - debtNow - P)}.`}</p>` : ''}
+      ${pct !== null ? `<p class="small ${pct >= 20 ? 'gasto' : 'muted'}">La cuota es el ${pct}% de lo que te entra al mes (promedio de los últimos meses).</p>` : ''}
+      <h2 style="margin:16px 0 6px">Lo que pagarías cada mes</h2>
+      <div class="small">
+        <div class="muted" style="display:grid;grid-template-columns:1fr auto auto;gap:12px;padding-bottom:4px"><span>Pagas hasta</span><span>Sin esta compra</span><span>Con esta compra</span></div>
+        ${proj.map(p => `<div style="display:grid;grid-template-columns:1fr auto auto;gap:12px;padding:6px 0;border-top:1px solid var(--line)"><span>${fmtShort(p.due)}</span><span class="num muted">${money(p.before)}</span><span class="num"><b>${money(p.after)}</b></span></div>`).join('')}
+        ${n > 12 ? `<div class="muted" style="padding-top:6px">…y ${n - 12} cuotas más.</div>` : ''}
+      </div>
+      <p class="small muted">Es un cálculo aproximado con cuota fija. El banco puede sumar seguro de desgravamen y ajustar la primera cuota por los días.</p>`;
+  };
+  openSheet(`<h3>Simular compra en cuotas · ${esc(c.name)}</h3>
+    <label class="field"><span>Precio (S/)</span><input id="s-amt" inputmode="decimal" placeholder="0.00"></label>
+    <div class="field"><span>Cuotas</span><div class="chips" id="s-chips">${[1, 3, 6, 12, 18, 24, 36].map(k => `<button class="chip ${k === st.n ? 'on' : ''}" data-n="${k}">${k}</button>`).join('')}
+      <input id="s-n" inputmode="numeric" value="${st.n}" style="width:64px;padding:6px 10px"></div></div>
+    <div class="grid2" style="align-items:end">
+      <label class="field"><span>TEA (%)</span><input id="s-tea" inputmode="decimal" value="${st.tea}"></label>
+      <div class="field"><button class="chip" id="s-free" style="width:100%;justify-content:center;padding:12px">Sin intereses</button></div>
+    </div>
+    <div id="s-res">${results()}</div>
+    <h2>Si decides comprarlo</h2>
+    <label class="field"><span>Qué es</span><input id="s-note" placeholder="Ej: Laptop"></label>
+    <label class="field"><span>Categoría</span><select id="s-cat">${S.categories.filter(x => x.kind === 'gasto').map(x => `<option value="${x.id}" ${x.id === 'ropa' ? 'selected' : ''}>${x.icon} ${esc(x.name)}</option>`).join('')}</select></label>
+    <button class="btn primary block" id="s-save">Registrar esta compra</button>`, sh => {
+    const refresh = () => {
+      $('#s-res').innerHTML = results();
+      $$('#s-chips [data-n]').forEach(b => b.classList.toggle('on', Number(b.dataset.n) === Number(st.n)));
+      $('#s-free').classList.toggle('on', st.free);
+      $('#s-tea').disabled = st.free;
+    };
+    sh.oninput = e => {
+      if (e.target.id === 's-amt') st.amount = e.target.value;
+      if (e.target.id === 's-n') st.n = e.target.value;
+      if (e.target.id === 's-tea') st.tea = e.target.value;
+      if (['s-amt', 's-n', 's-tea'].includes(e.target.id)) refresh();
+    };
+    sh.onclick = e => {
+      const nb = e.target.closest('[data-n]');
+      if (nb) { st.n = Number(nb.dataset.n); $('#s-n').value = st.n; refresh(); return; }
+      if (e.target.id === 's-free') { st.free = !st.free; refresh(); return; }
+      if (e.target.id === 's-save') {
+        const amount = toCents(st.amount), n = Math.max(1, Math.min(60, parseInt(st.n, 10) || 1));
+        if (!amount) return toast('Pon el precio');
+        const t = { id: uid(), type: 'gasto', amount, date: today(), note: $('#s-note').value.trim(), accountId: id, categoryId: $('#s-cat').value, created: Date.now() };
+        if (n > 1) { t.cuotas = n; t.tea = st.free ? 0 : parseFloat(String(st.tea).replace(',', '.')) || 0; }
+        S.tx.push(t); save(); render(); cardSheet(id);
+        toast(`Compra registrada en ${n === 1 ? '1 cuota' : n + ' cuotas'}`);
+      }
+    };
+  });
 }
 
 function editDebt(id) {
@@ -804,10 +1117,11 @@ $('#tabs').addEventListener('click', e => {
 $('#backdrop').addEventListener('click', closeSheet);
 
 $('#app').addEventListener('click', e => {
-  const t = e.target.closest('[data-edit],[data-acc],[data-debt],[data-cat],[data-month],[data-act],[data-unlearn]');
+  const t = e.target.closest('[data-edit],[data-acc],[data-card],[data-debt],[data-cat],[data-month],[data-act],[data-unlearn]');
   if (!t) return;
   const ds = t.dataset;
   if (ds.edit) editTx(ds.edit);
+  else if (ds.card) cardSheet(ds.card);
   else if (ds.acc) editAccount(ds.acc);
   else if (ds.debt) editDebt(ds.debt);
   else if (ds.cat) editCategory(ds.cat);
@@ -842,6 +1156,6 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 }
 
 // Para pruebas desde la consola
-window.__finanzas = { parse, toCents };
+window.__finanzas = { parse, toCents, cuotaSchedule, cardInfo };
 
 render();

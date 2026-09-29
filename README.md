@@ -15,9 +15,28 @@ Escribe como hablas y la app lo clasifica sola:
 | `retiré 200` | Transferencia Débito → Efectivo |
 | `ahorré 300 de yape` | Transferencia Yape → Ahorros |
 | `pago tarjeta 450 desde débito` | Pago de la tarjeta de crédito |
+| `laptop 2400 cmr 12 cuotas` | Compra en la CMR en 12 cuotas con la TEA de la tarjeta |
+| `zapatillas 300 en 3 cuotas sin intereses` | Compra en 3 cuotas sin intereses |
 
 También lee las notificaciones de Yape y del banco: cópialas y toca **📋 Pegar**.
 Si corriges una categoría, recuerda esas palabras para la próxima vez.
+
+## Tarjetas de crédito
+
+En **Cuentas**, al tocar la tarjeta, se configura con la línea, el día de cierre, el día de pago y
+la TEA. También se carga lo que debes hoy: el último estado de cuenta, los consumos todavía no
+facturados y las compras en cuotas que ya vienes pagando.
+
+Con eso la ficha de la tarjeta muestra:
+
+- Cuánto pagar ahora y hasta cuándo, y el monto del próximo estado de cuenta.
+- La deuda total y la línea disponible.
+- Las cuotas vigentes, con cuántas faltan.
+- Un **simulador de cuotas**: la cuota mensual, los intereses y cómo quedarían tus pagos mes a
+  mes con y sin esa compra.
+
+Las cuotas usan cuota fija con la TEA convertida a tasa mensual. Es una aproximación: el banco
+puede sumar seguro de desgravamen.
 
 ## Instalar en el iPhone
 
