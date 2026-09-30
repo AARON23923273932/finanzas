@@ -83,6 +83,8 @@ function defaults() {
     tx: [],
     rules: {},
     settings: { savingGoalPct: 20, defaultAccount: 'yape', lastBackup: null, catsSeen: DEFAULT_CATS.map(c => c.id) },
+    deleted: {}, // «coleccion:id» → cuándo se borró (para que la sincronización no lo resucite)
+    meta: {},    // cuándo cambiaron por última vez los ajustes y las reglas
   };
 }
 
@@ -104,6 +106,8 @@ function normalizeState(s) {
     (Array.isArray(s.tx) ? s.tx : []).forEach(t => { if (t && t.accountId === a.id && t.cuotas > 1 && t.tea === 0 && !t.sinInteres) t.tea = null; });
   });
   out.rules = obj(s.rules);
+  out.deleted = Object.fromEntries(Object.entries(obj(s.deleted)).filter(([, v]) => Number.isFinite(v)));
+  out.meta = Object.fromEntries(Object.entries(obj(s.meta)).filter(([, v]) => Number.isFinite(v)));
   const rs = obj(s.settings);
   const goal = Number(rs.savingGoalPct);
   out.settings = {
@@ -147,6 +151,17 @@ let saveFailed = false;
 // Copia de lo último que quedó bien (lo leído al abrir o el último guardado): a eso se vuelve si no se puede guardar
 let lastGood = JSON.stringify(S);
 const revert = () => { S = normalizeState(JSON.parse(lastGood)); };
+let needRender = false;
+// Estado que llegó de otro dispositivo: se guarda tal cual (ya trae sus marcas) y se muestra
+function persistState(state) {
+  S = state;
+  try { const json = JSON.stringify(S); localStorage.setItem(KEY, json); lastGood = json; }
+  catch (e) { showAlert(`<span>⚠️ Llegaron datos del otro dispositivo pero no hay espacio para guardarlos aquí.</span><button data-alert="close" aria-label="Cerrar">✕</button>`); }
+  const a = document.activeElement;
+  // Con el teclado abierto no se redibuja (se perdería lo que se está escribiendo): se hace al salir del campo
+  if (a && $('#app').contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) needRender = true;
+  else if ($('#sheet').hidden) render();
+}
 function showAlert(html) {
   const el = $('#alert'); el.innerHTML = html; el.hidden = false;
   document.documentElement.style.setProperty('--alert-h', `${el.offsetHeight + 16}px`);
@@ -159,10 +174,12 @@ function save() {
     return false;
   }
   try {
+    stampChanges(JSON.parse(lastGood), S); // qué cambió y cuándo: así se juntan dos dispositivos sin pisarse
     const json = JSON.stringify(S);
     localStorage.setItem(KEY, json);
     lastGood = json;
     if (saveFailed) { saveFailed = false; hideAlert(); }
+    scheduleSync();
     return true;
   } catch (e) {
     // La pantalla nunca muestra algo que se perdería al cerrar la app
@@ -747,7 +764,7 @@ function viewInicio() {
   const needBackup = S.tx.length >= 5 && (!S.settings.lastBackup || (Date.now() - parseDate(S.settings.lastBackup)) / 864e5 > 14);
 
   return `
-  <h1>Finanzas</h1>
+  <h1>Finanzas ${syncChipHTML()}</h1>
   ${updateBanner()}
   ${loadErrorBanner()}
   ${needBackup ? `<div class="banner"><span>Tus datos viven solo en este iPhone. Haz un respaldo.</span><button class="linkbtn" data-act="backup">Respaldar</button></div>` : ''}
@@ -892,6 +909,9 @@ function viewAjustes() {
     ${rules.length ? rules.map(([w, c]) => `<div style="display:flex;justify-content:space-between;padding:6px 0"><span>«${esc(w)}» → ${esc(cat(c)?.name || '?')}</span><button class="linkbtn" data-unlearn="${esc(w)}">Olvidar</button></div>`).join('') : '<span class="muted">Cuando corrijas la categoría de un gasto, recordaré esas palabras para la próxima.</span>'}
   </div>
 
+  <h2>Sincronización (iPhone ↔ iPad)</h2>
+  ${syncSectionHTML()}
+
   <h2>Respaldo</h2>
   <div class="card">
     <p class="small muted" style="margin-top:0">Los datos se guardan solo en este dispositivo. Guarda el respaldo en iCloud Drive (Archivos) para no perderlos y para pasarlos al iPad.</p>
@@ -923,6 +943,7 @@ function openSheet(html, onMount, keepScroll) {
 function closeSheet() {
   $('#sheet').hidden = true; $('#backdrop').hidden = true; $('#sheet').innerHTML = '';
   document.documentElement.classList.remove('sheet-open');
+  flushPendingSync();
 }
 
 function picker(title, opts, current, onPick) {
@@ -1375,12 +1396,12 @@ function validateBackup(data) {
   if (!data || typeof data !== 'object' || !Array.isArray(data.accounts)) bad('respaldo', 'falta la lista de cuentas («accounts»)');
   // Un campo que la app no conoce casi siempre es un nombre mal escrito: mejor avisar que perder el dato
   const KNOWN = {
-    respaldo: ['version', 'accounts', 'categories', 'debts', 'tx', 'rules', 'settings'],
-    cuenta: ['id', 'name', 'type', 'initial', 'aliases', 'limit', 'closeDay', 'payDay', 'tea', 'statement0', 'unbilled', 'plans', 'setupAt'],
+    respaldo: ['version', 'accounts', 'categories', 'debts', 'tx', 'rules', 'settings', 'deleted', 'meta'],
+    cuenta: ['id', 'name', 'type', 'initial', 'aliases', 'limit', 'closeDay', 'payDay', 'tea', 'statement0', 'unbilled', 'plans', 'setupAt', 'u'],
     cuota: ['desc', 'cuota', 'remaining'],
-    categoría: ['id', 'name', 'icon', 'kind', 'words'],
-    deuda: ['id', 'name', 'total', 'paidBefore', 'due', 'note', 'since'],
-    movimiento: ['id', 'type', 'amount', 'date', 'note', 'accountId', 'toAccountId', 'debtId', 'categoryId', 'created', 'cuotas', 'tea', 'sinInteres'],
+    categoría: ['id', 'name', 'icon', 'kind', 'words', 'u'],
+    deuda: ['id', 'name', 'total', 'paidBefore', 'due', 'note', 'since', 'u'],
+    movimiento: ['id', 'type', 'amount', 'date', 'note', 'accountId', 'toAccountId', 'debtId', 'categoryId', 'created', 'cuotas', 'tea', 'sinInteres', 'u'],
     ajustes: ['savingGoalPct', 'defaultAccount', 'lastBackup', 'catsSeen'],
   };
   const known = (o, kind, where) => {
@@ -1555,7 +1576,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet
 })();
 
 $('#app').addEventListener('click', e => {
-  const t = e.target.closest('[data-edit],[data-acc],[data-card],[data-debt],[data-cat],[data-month],[data-act],[data-unlearn],[data-filter]');
+  const t = e.target.closest('[data-edit],[data-acc],[data-card],[data-debt],[data-cat],[data-month],[data-act],[data-unlearn],[data-filter],[data-tab-go]');
   if (!t) return;
   const ds = t.dataset;
   if (ds.edit) editTx(ds.edit);
@@ -1574,6 +1595,10 @@ $('#app').addEventListener('click', e => {
   else if (ds.act === 'export-corrupt') exportCorrupt();
   else if (ds.act === 'drop-corrupt') dropCorrupt();
   else if (ds.act === 'reload') location.reload();
+  else if (ds.act === 'sync-connect') syncConnect();
+  else if (ds.act === 'sync-now') syncNow();
+  else if (ds.act === 'sync-off') syncDisconnect();
+  else if (ds.tabGo) { V.tab = ds.tabGo; render(); window.scrollTo(0, 0); }
   else if (ds.act === 'reset') {
     if (confirm('¿Borrar TODOS los movimientos, cuentas y deudas? Haz un respaldo antes.') && confirm('¿Seguro? No se puede deshacer.')) {
       S = defaults(); save(); render();
@@ -1595,7 +1620,7 @@ $('#app').addEventListener('change', e => {
 });
 
 // Versión de este código; se sube junto con VERSION en sw.js
-const APP_VERSION = 'finanzas-v6';
+const APP_VERSION = 'finanzas-v7';
 let updateReady = false;
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   // Si la caché activa es de otra versión, hay una actualización: se ofrece en Inicio y Ajustes (no se recarga sola)
@@ -1611,6 +1636,12 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 }
 
 // Para pruebas desde la consola
-window.__finanzas = { parse, toCents, cuotaSchedule, cardInfo };
+window.__finanzas = { parse, toCents, cuotaSchedule, cardInfo, mergeStates, stampChanges };
+
+document.addEventListener('focusout', () => setTimeout(() => {
+  const a = document.activeElement;
+  if (needRender && $('#sheet').hidden && !(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))) { needRender = false; render(); }
+}, 0));
 
 render();
+if (readSyncCfg()) syncNow();

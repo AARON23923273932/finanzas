@@ -234,3 +234,7 @@ details.tbl table { width: 100%; border-collapse: collapse; font-size: 13px; mar
 details.tbl th { text-align: right; color: var(--muted); font-weight: 600; padding: 4px 0; border-bottom: 1px solid var(--line); }
 details.tbl td { text-align: right; padding: 4px 0; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
 details.tbl th:first-child, details.tbl td:first-child { text-align: left; }
+
+/* Indicador de sincronización */
+.sync-chip { float: right; border: 0; background: var(--chip); border-radius: 999px; width: 40px; height: 40px; font-size: 18px; margin-top: -2px; }
+.sync-chip.error { background: color-mix(in srgb, var(--gasto) 22%, transparent); }

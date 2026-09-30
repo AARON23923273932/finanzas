@@ -1,6 +1,6 @@
 // Sube la versión cada vez que cambies archivos, para que el iPhone baje lo nuevo.
-const VERSION = 'finanzas-v6'; // igual que APP_VERSION en app.js
-const FILES = ['./', 'index.html', 'styles.css', 'charts.js', 'app.js', 'manifest.webmanifest', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
+const VERSION = 'finanzas-v7'; // igual que APP_VERSION en app.js
+const FILES = ['./', 'index.html', 'styles.css', 'charts.js', 'sync.js', 'app.js', 'manifest.webmanifest', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
 
 // Cada versión se descarga completa y de una vez; si algo falla, la instalación no sigue y queda la anterior.
 self.addEventListener('install', e => {

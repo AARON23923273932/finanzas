@@ -44,6 +44,19 @@ puede sumar seguro de desgravamen.
 2. Toca **Compartir → Agregar a pantalla de inicio**.
 3. Ábrela siempre desde el ícono. Safari y el ícono guardan datos por separado.
 
+## Sincronizar iPhone y iPad
+
+En **Ajustes → Sincronización**, cada dispositivo se conecta al repositorio privado `finanzas-datos`
+con un código de acceso de GitHub y una contraseña de cifrado. Hay que usar el mismo código y la
+misma contraseña en los dos.
+
+- Los datos se cifran en el dispositivo (PBKDF2 + AES-GCM) antes de subir. GitHub solo guarda
+  texto ilegible, y la contraseña nunca sale del teléfono.
+- Cada registro guarda la hora de su último cambio. Al sincronizar gana el cambio más reciente,
+  registro por registro, y lo borrado queda borrado. Si se registra algo en los dos dispositivos,
+  se conservan las dos cosas.
+- Se sincroniza al abrir la app, al volver a ella y un momento después de cada cambio.
+
 ## Datos
 
 - Se guardan solo en el dispositivo (`localStorage`). Nada sale del teléfono.
