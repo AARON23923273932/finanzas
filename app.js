@@ -194,6 +194,8 @@ if (navigator.storage && navigator.storage.persist) navigator.storage.persist().
 const acc = id => S.accounts.find(a => a.id === id);
 const cat = id => S.categories.find(c => c.id === id);
 const debt = id => S.debts.find(d => d.id === id);
+// Categoría de un movimiento; si esa categoría se borró, la de respaldo (sin reescribir el movimiento)
+const catIdOf = t => (t.categoryId && S.categories.some(c => c.id === t.categoryId) ? t.categoryId : (t.type === 'ingreso' ? 'otros_ing' : 'otros'));
 
 /* ============ Lector de texto ============ */
 const STOP = new Set('con en por de del a al el la los las un una y para mi mis desde use hoy ayer anteayer antier soles sol lucas luca s pague gaste compre gasto pagar me se lo le que tu su mas'.split(' '));
@@ -499,7 +501,7 @@ function cardInfo(card) {
     if (t.type === 'gasto' && t.accountId === card.id) {
       const n = t.cuotas || 1, c0 = closeFor(card, t.date);
       if (n === 1) { add(c0, t.amount); continue; }
-      const rows = cuotaSchedule(t.amount, n, t.tea ?? card.tea ?? 0);
+      const rows = cuotaSchedule(t.amount, n, t.tea ?? card.firstTea ?? card.tea ?? 0);
       let billed = 0;
       rows.forEach((r, k) => {
         const c = closeAdd(card, c0, k);
@@ -507,7 +509,7 @@ function cardInfo(card) {
         if (c < t0) billed++;
         if (r.interest && c <= t0) interest.push({ id: `int-${t.id}-${r.k}`, virtual: true, type: 'gasto', categoryId: 'intereses', accountId: card.id, amount: r.interest, date: c, created: 0, note: `Interés cuota ${r.k}/${n}${t.note ? ' · ' + t.note : ''}` });
       });
-      if (billed < n) plans.push({ label: t.note || cat(t.categoryId)?.name || 'Compra', cuota: rows[0].amount, left: n - billed, of: n, end: closeAdd(card, c0, n - 1) });
+      if (billed < n) plans.push({ label: t.note || cat(catIdOf(t))?.name || 'Compra', cuota: rows[0].amount, left: n - billed, of: n, end: closeAdd(card, c0, n - 1) });
     } else if ((t.type === 'transferencia' || t.type === 'pago_deuda') && t.accountId === card.id) add(closeFor(card, t.date), t.amount);
     else if ((t.type === 'transferencia' && t.toAccountId === card.id) || (t.type === 'ingreso' && t.accountId === card.id)) paid += t.amount;
   }
@@ -536,7 +538,7 @@ function summary(month) {
   for (const t of allTx()) {
     if (!t.date.startsWith(month)) continue;
     if (t.type === 'ingreso') inc += t.amount;
-    else if (t.type === 'gasto') { exp += t.amount; byCat[t.categoryId] = (byCat[t.categoryId] || 0) + t.amount; }
+    else if (t.type === 'gasto') { exp += t.amount; byCat[catIdOf(t)] = (byCat[catIdOf(t)] || 0) + t.amount; }
     else if (t.type === 'pago_deuda') debtPay += t.amount;
     else if (t.type === 'transferencia' && acc(t.toAccountId)?.type === 'ahorro' && acc(t.accountId)?.type !== 'ahorro') saved += t.amount;
   }
@@ -588,7 +590,7 @@ function render() {
 }
 
 function txLine(t) {
-  const c = cat(t.categoryId), a = acc(t.accountId);
+  const c = t.type === 'gasto' || t.type === 'ingreso' ? cat(catIdOf(t)) : null, a = acc(t.accountId);
   let icon = c?.icon || '•', title = t.note || c?.name || TYPES[t.type].label, sub = [], cls = 'gasto', sign = '−';
   if (t.type === 'ingreso') { cls = 'ingreso'; sign = '+'; }
   if (t.type === 'transferencia') {
@@ -639,7 +641,7 @@ function previewHTML() {
   if (d.onCard) {
     const cuota = d.amount && d.cuotas > 1 ? ` · ${money(cuotaSchedule(d.amount, d.cuotas, d.tea)[0].amount)}/mes` : '';
     chips.push(`<button class="chip" data-pick="cuotas">📆 ${d.cuotas === 1 ? '1 cuota' : d.cuotas + ' cuotas'}${cuota}</button>`);
-    if (d.cuotas > 1) chips.push(`<button class="chip ${d.sinInteres ? 'on' : ''}" data-pick="sinInteres">${d.sinInteres ? 'Sin intereses' : d.tea ? `TEA ${d.tea}%` : 'TEA sin configurar'}</button>`);
+    if (d.cuotas > 1) chips.push(`<button class="chip ${d.sinInteres ? 'on' : ''}" data-pick="sinInteres">${d.sinInteres ? 'Sin intereses' : d.tea ? `TEA ${esc(d.tea)}%` : 'TEA sin configurar'}</button>`);
   }
   chips.push(`<label class="chip">📅 ${esc(dayLabel(d.date))}<input type="date" id="pdate" max="${today()}" value="${esc(d.date)}"></label>`);
   return `<div class="preview">
@@ -739,7 +741,7 @@ function saveDraft() {
   V.text = ''; V.over = {};
   render();
   $('#q').focus();
-  const label = t.categoryId ? cat(t.categoryId).name : TYPES[t.type].label;
+  const label = t.categoryId ? cat(catIdOf(t)).name : TYPES[t.type].label;
   toast(`Guardado: ${label} · ${money(t.amount)} · ${acc(t.accountId)?.name}`, 'Deshacer', () => {
     S.tx = S.tx.filter(x => x.id !== lastSaved); save(); render();
   });
@@ -755,7 +757,7 @@ function viewInicio() {
   const otherDebt = S.debts.reduce((x, d) => x + debtRemaining(d), 0);
   const cats = Object.entries(s.byCat).sort((x, y) => y[1] - x[1]);
   const incCats = {};
-  allTx().forEach(t => { if (t.type === 'ingreso' && t.date.startsWith(V.month)) incCats[t.categoryId] = (incCats[t.categoryId] || 0) + t.amount; });
+  allTx().forEach(t => { if (t.type === 'ingreso' && t.date.startsWith(V.month)) incCats[catIdOf(t)] = (incCats[catIdOf(t)] || 0) + t.amount; });
   const incList = Object.entries(incCats).sort((x, y) => y[1] - x[1]);
   const debtAlerts = S.debts.filter(d => d.due && debtRemaining(d) > 0 && (parseDate(d.due) - parseDate(today())) / 864e5 <= 10);
   const max = cats[0]?.[1] || 1;
@@ -828,7 +830,7 @@ function viewMovs() {
   if (V.filter === 'gasto') list = list.filter(t => t.type === 'gasto');
   if (V.filter === 'ingreso') list = list.filter(t => t.type === 'ingreso');
   if (V.filter === 'otros') list = list.filter(t => t.type === 'transferencia' || t.type === 'pago_deuda');
-  if (q) list = list.filter(t => norm([t.note, cat(t.categoryId)?.name, acc(t.accountId)?.name, acc(t.toAccountId)?.name, debt(t.debtId)?.name].join(' ')).includes(q));
+  if (q) list = list.filter(t => norm([t.note, t.categoryId ? cat(catIdOf(t))?.name : '', acc(t.accountId)?.name, acc(t.toAccountId)?.name, debt(t.debtId)?.name].join(' ')).includes(q));
   list.sort(byNewest);
   const groups = {};
   list.forEach(t => (groups[t.date] = groups[t.date] || []).push(t));
@@ -957,7 +959,7 @@ function editTx(id) {
   if (!t) return;
   let type = t.type;
   const draw = keep => {
-    const catOpts = S.categories.filter(c => c.kind === type).map(c => `<option value="${esc(c.id)}" ${c.id === t.categoryId ? 'selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('');
+    const catOpts = S.categories.filter(c => c.kind === type).map(c => `<option value="${esc(c.id)}" ${t.categoryId && c.id === catIdOf(t) ? 'selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('');
     const accOpts = sel => S.accounts.map(a => `<option value="${esc(a.id)}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
     openSheet(`<h3>Editar movimiento</h3>
       <div class="seg">${Object.entries(TYPES).map(([k, v]) => `<button data-type="${k}" class="${k === type ? 'on' : ''}">${v.label}</button>`).join('')}</div>
@@ -968,8 +970,8 @@ function editTx(id) {
       <label class="field"><span>${type === 'transferencia' ? 'Desde' : 'Cuenta'}</span><select id="e-acc">${accOpts(t.accountId)}</select></label>
       ${type === 'transferencia' ? `<label class="field"><span>Hacia</span><select id="e-to">${accOpts(t.toAccountId)}</select></label>` : ''}
       ${type === 'gasto' && S.accounts.some(a => a.type === 'credito') ? `<div class="grid2">
-        <label class="field"><span>Cuotas (solo tarjeta)</span><input id="e-cuotas" inputmode="numeric" value="${t.cuotas || 1}"></label>
-        <label class="field"><span>TEA (%)</span><input id="e-tea" inputmode="decimal" value="${t.tea ?? ''}" placeholder="la de la tarjeta"></label></div>` : ''}
+        <label class="field"><span>Cuotas (solo tarjeta)</span><input id="e-cuotas" inputmode="numeric" value="${esc(t.cuotas || 1)}"></label>
+        <label class="field"><span>TEA (%)</span><input id="e-tea" inputmode="decimal" value="${esc(t.tea ?? '')}" placeholder="la de la tarjeta"></label></div>` : ''}
       <label class="field"><span>Fecha</span><input id="e-date" type="date" max="${t.date > today() ? esc(t.date) : today()}" value="${esc(t.date)}"></label>
       <div class="actions"><button class="btn danger" id="e-del">Eliminar</button><button class="btn primary" id="e-save">Guardar</button></div>`, sh => {
       sh.onclick = e => {
@@ -1057,7 +1059,7 @@ function editAccount(id) {
       <label class="field"><span>Compras en 1 cuota hechas después del último cierre (S/)</span><input id="a-unb" inputmode="decimal" value="${cents(f.unbilled)}" placeholder="0.00" ${dis()}></label>
       <div class="field"><span>Compras en cuotas que ya vienes pagando: la cuota y cuántas faltan después de este estado de cuenta</span>
         ${f.plans.map((p, i) => `<div class="plan-row" style="display:grid;grid-template-columns:1fr 84px 60px 24px;gap:6px;margin-bottom:6px;align-items:center">
-          <input class="p-desc" placeholder="Qué fue" value="${esc(p.desc)}" ${dis()}><input class="p-cuota" inputmode="decimal" placeholder="Cuota" value="${cents(p.cuota)}" ${dis()}><input class="p-rem" inputmode="numeric" placeholder="Faltan" value="${p.remaining || ''}" ${dis()}>${locked() ? '<span></span>' : `<button class="linkbtn" data-rmplan="${i}" aria-label="Quitar">✕</button>`}</div>`).join('')}
+          <input class="p-desc" placeholder="Qué fue" value="${esc(p.desc)}" ${dis()}><input class="p-cuota" inputmode="decimal" placeholder="Cuota" value="${cents(p.cuota)}" ${dis()}><input class="p-rem" inputmode="numeric" placeholder="Faltan" value="${esc(p.remaining || '')}" ${dis()}>${locked() ? '<span></span>' : `<button class="linkbtn" data-rmplan="${i}" aria-label="Quitar">✕</button>`}</div>`).join('')}
         ${locked() ? '' : '<button class="linkbtn" id="a-addplan">+ Agregar compra en cuotas</button>'}
       </div>`;
     openSheet(`<h3>${isNew ? 'Nueva cuenta' : credit ? 'Configurar tarjeta' : 'Editar cuenta'}</h3>
@@ -1102,7 +1104,8 @@ function editAccount(id) {
             else if (a.setupAt && !hasSnap && isoDate(new Date(a.setupAt)) === today()) delete a.setupAt;
             const tea = parseFloat(String(f.tea).replace(',', '.'));
             // La primera vez que se pone la TEA, las compras en cuotas que no la tenían la toman
-            if (!(a.tea > 0) && tea > 0) S.tx.forEach(t => { if (t.accountId === a.id && t.cuotas > 1 && t.tea == null) t.tea = tea; });
+            // Las compras en cuotas sin TEA propia usan la primera TEA que tuvo la tarjeta (no la de hoy si cambia)
+            if (tea > 0 && a.firstTea == null) a.firstTea = tea;
             Object.assign(a, { limit: f.limit, closeDay: Number(f.closeDay) || null, payDay: Number(f.payDay) || null, tea: tea > 0 ? tea : null, statement0: f.statement0, unbilled: f.unbilled, plans });
             a.initial = -(f.statement0 + f.unbilled + plans.reduce((x, p) => x + p.cuota * p.remaining, 0));
           } else {
@@ -1318,7 +1321,6 @@ function editCategory(id) {
         const fallback = c.kind === 'ingreso' ? 'otros_ing' : 'otros';
         const n = S.tx.filter(t => t.categoryId === c.id).length;
         if (!confirm(`¿Eliminar ${c.name}?${n ? ` Sus ${n} movimientos pasan a «${cat(fallback).name}».` : ''}`)) return;
-        S.tx.forEach(t => { if (t.categoryId === c.id) t.categoryId = fallback; });
         Object.keys(S.rules).forEach(k => { if (S.rules[k] === c.id) delete S.rules[k]; });
         S.categories = S.categories.filter(x => x.id !== c.id); save(); closeSheet(); render();
       }
@@ -1397,7 +1399,7 @@ function validateBackup(data) {
   // Un campo que la app no conoce casi siempre es un nombre mal escrito: mejor avisar que perder el dato
   const KNOWN = {
     respaldo: ['version', 'accounts', 'categories', 'debts', 'tx', 'rules', 'settings', 'deleted', 'meta'],
-    cuenta: ['id', 'name', 'type', 'initial', 'aliases', 'limit', 'closeDay', 'payDay', 'tea', 'statement0', 'unbilled', 'plans', 'setupAt', 'u'],
+    cuenta: ['id', 'name', 'type', 'initial', 'aliases', 'limit', 'closeDay', 'payDay', 'tea', 'statement0', 'unbilled', 'plans', 'setupAt', 'firstTea', 'u'],
     cuota: ['desc', 'cuota', 'remaining'],
     categoría: ['id', 'name', 'icon', 'kind', 'words', 'u'],
     deuda: ['id', 'name', 'total', 'paidBefore', 'due', 'note', 'since', 'u'],
@@ -1428,7 +1430,8 @@ function validateBackup(data) {
     if (!Object.prototype.hasOwnProperty.call(ACC_TYPES, a.type)) bad(w, 'tipo desconocido');
     if (!optInt(a.initial) || !optInt(a.limit) || !optInt(a.statement0) || !optInt(a.unbilled)) bad(w, 'montos inválidos');
     for (const k of ['closeDay', 'payDay']) if (a[k] != null && !(int(a[k]) && a[k] >= 1 && a[k] <= 31)) bad(w, 'día inválido');
-    if (a.tea != null && !Number.isFinite(a.tea)) bad(w, 'TEA inválida');
+    if ((a.tea != null && !Number.isFinite(a.tea)) || (a.firstTea != null && !Number.isFinite(a.firstTea))) bad(w, 'TEA inválida');
+    if (a.u != null && !Number.isFinite(a.u)) bad(w, 'marca de cambio inválida');
     if (a.setupAt != null && !Number.isFinite(a.setupAt)) bad(w, 'fecha de configuración inválida');
     if (a.plans != null && (!Array.isArray(a.plans) || a.plans.some(p => !p || !int(p.cuota) || !int(p.remaining)))) bad(w, 'cuotas inválidas');
     a.aliases = String(a.aliases ?? '');
@@ -1474,7 +1477,6 @@ function validateBackup(data) {
     if (!accIds.includes(t.accountId)) bad(w, `la cuenta «${t.accountId}» no existe`);
     if (t.type === 'transferencia' && !accIds.includes(t.toAccountId)) bad(w, `la cuenta «${t.toAccountId}» no existe`);
     if (t.type === 'pago_deuda' && !debtIds.includes(t.debtId)) bad(w, `la deuda «${t.debtId}» no existe`);
-    if (t.categoryId != null && !catIds.includes(t.categoryId)) bad(w, `la categoría «${t.categoryId}» no existe`);
   });
   return st;
 }
@@ -1482,8 +1484,14 @@ function validateBackup(data) {
 function importText(text) {
   const prev = S;
   try {
-    const st = validateBackup(JSON.parse(String(text).trim()));
-    if (!confirm(`Esto reemplaza lo que hay ahora (${S.tx.length} movimientos) por el respaldo (${st.accounts.length} cuentas, ${st.debts.length} deudas, ${st.tx.length} movimientos). ¿Seguir?`)) return false;
+    let st = validateBackup(JSON.parse(String(text).trim()));
+    const resumen = `${st.accounts.length} cuentas, ${st.debts.length} deudas, ${st.tx.length} movimientos`;
+    if (readSyncCfg()) {
+      // Con otro dispositivo conectado, reemplazar también borraría allá: por defecto se junta
+      if (confirm(`Estás sincronizando con otro dispositivo.\n\nAceptar: JUNTAR el respaldo (${resumen}) con tus datos. Agrega lo que falta y no borra nada.\n\nCancelar: ver la opción de reemplazar todo.`)) {
+        st = mergeStates(st, snapshotLocal());
+      } else if (!confirm(`¿REEMPLAZAR todo por el respaldo (${resumen})?\n\nTambién se reemplaza en la nube y en tu otro dispositivo: lo que no esté en el respaldo se borrará en todos.`)) return false;
+    } else if (!confirm(`Esto reemplaza lo que hay ahora (${S.tx.length} movimientos) por el respaldo (${resumen}). ¿Seguir?`)) return false;
     // Prueba de que se puede mostrar antes de guardar nada
     S = st;
     try { viewInicio(); viewMovs(); viewCuentas(); viewGraficos(); viewAjustes(); }
@@ -1598,9 +1606,17 @@ $('#app').addEventListener('click', e => {
   else if (ds.act === 'sync-connect') syncConnect();
   else if (ds.act === 'sync-now') syncNow();
   else if (ds.act === 'sync-off') syncDisconnect();
+  else if (ds.act === 'sync-token') syncChangeToken();
   else if (ds.tabGo) { V.tab = ds.tabGo; render(); window.scrollTo(0, 0); }
   else if (ds.act === 'reset') {
-    if (confirm('¿Borrar TODOS los movimientos, cuentas y deudas? Haz un respaldo antes.') && confirm('¿Seguro? No se puede deshacer.')) {
+    if (readSyncCfg()) {
+      if (confirm('Estás sincronizando con otro dispositivo.\n\nAceptar: borrar SOLO en este dispositivo. Se desconecta la sincronización; la nube y tu otro dispositivo no cambian.\n\nCancelar: ver la opción de borrar en todos.')) {
+        syncState.gen++; writeSyncCfg(null); setSyncStatus('off');
+        S = defaults(); save(); render();
+      } else if (confirm('¿Borrar TODO en TODOS tus dispositivos y en la nube? No se puede deshacer.') && confirm('¿Seguro?')) {
+        S = defaults(); save(); render();
+      }
+    } else if (confirm('¿Borrar TODOS los movimientos, cuentas y deudas? Haz un respaldo antes.') && confirm('¿Seguro? No se puede deshacer.')) {
       S = defaults(); save(); render();
     }
   }
@@ -1620,7 +1636,7 @@ $('#app').addEventListener('change', e => {
 });
 
 // Versión de este código; se sube junto con VERSION en sw.js
-const APP_VERSION = 'finanzas-v7';
+const APP_VERSION = 'finanzas-v8';
 let updateReady = false;
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   // Si la caché activa es de otra versión, hay una actualización: se ofrece en Inicio y Ajustes (no se recarga sola)

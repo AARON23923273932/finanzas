@@ -17,45 +17,105 @@ const SYNC_ITER = 310000;
 
 /* ---------- Marcas de cambio y unión ---------- */
 const stripU = r => { const { u, ...rest } = r || {}; return rest; };
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+// Referencias que un movimiento vivo necesita: esas cuentas y deudas no se pueden perder al unir
+const REFS = [['accounts', t => [t.accountId, t.toAccountId]], ['debts', t => [t.debtId]]];
 
-// Al guardar: marca con `now` lo que cambió respecto del último estado guardado, y lo borrado
+// Al guardar: marca lo que cambió respecto de lo último guardado. Reloj híbrido: un cambio siempre
+// queda después de la versión que se vio (aunque los relojes del iPhone y el iPad no coincidan).
 function stampChanges(prev, cur, now = Date.now()) {
   cur.deleted = { ...(cur.deleted || {}) };
   cur.meta = { ...(cur.meta || {}) };
+  const tick = old => Math.max(now, (old || 0) + 1);
   for (const col of SYNC_COLS) {
-    const before = new Map((prev[col] || []).map(r => [r.id, JSON.stringify(stripU(r))]));
+    const before = new Map((prev[col] || []).map(r => [r.id, r]));
     const ids = new Set();
     for (const r of cur[col] || []) {
       ids.add(r.id);
-      if (before.get(r.id) !== JSON.stringify(stripU(r))) r.u = now;
+      const p = before.get(r.id);
+      if (!p || !same(stripU(p), stripU(r))) r.u = tick(Math.max(p ? p.u || 0 : 0, cur.deleted[`${col}:${r.id}`] || 0));
     }
-    for (const id of before.keys()) if (!ids.has(id)) cur.deleted[`${col}:${id}`] = now;
+    for (const [id, p] of before) if (!ids.has(id)) cur.deleted[`${col}:${id}`] = tick(p.u);
   }
-  if (JSON.stringify(prev.settings || {}) !== JSON.stringify(cur.settings || {})) cur.meta.settingsU = now;
-  if (JSON.stringify(prev.rules || {}) !== JSON.stringify(cur.rules || {})) cur.meta.rulesU = now;
+  // Ajustes y reglas aprendidas: cada clave por separado
+  const ps = prev.settings || {}, cs = cur.settings || {};
+  for (const k of new Set([...Object.keys(ps), ...Object.keys(cs)])) if (!same(ps[k], cs[k])) cur.meta[`s:${k}`] = tick(cur.meta[`s:${k}`]);
+  const pr = prev.rules || {}, cr = cur.rules || {};
+  for (const k of Object.keys(cr)) if (pr[k] !== cr[k]) cur.meta[`r:${k}`] = tick(Math.max(cur.meta[`r:${k}`] || 0, cur.deleted[`rules:${k}`] || 0));
+  for (const k of Object.keys(pr)) if (!(k in cr)) cur.deleted[`rules:${k}`] = tick(cur.meta[`r:${k}`]);
   return cur;
 }
 
-// Junta dos estados. Por registro gana el `u` más alto (empate: `remote`, así todos convergen igual).
-// Un registro borrado queda borrado salvo que se haya cambiado DESPUÉS del borrado.
+// Datos de antes de sincronizar (sin marcas): lo que difiere de fábrica pasa a valer 1 y lo de fábrica
+// que ya no está queda borrado en 1. Así le gana a una instalación sin tocar, y pierde contra cualquier cambio real.
+function baselineStamp(local, def) {
+  local.deleted = { ...(local.deleted || {}) };
+  local.meta = { ...(local.meta || {}) };
+  for (const col of SYNC_COLS) {
+    const d = new Map((def[col] || []).map(r => [r.id, r]));
+    const ids = new Set((local[col] || []).map(r => r.id));
+    for (const r of local[col] || []) if (!r.u && !(d.has(r.id) && same(stripU(d.get(r.id)), stripU(r)))) r.u = 1;
+    for (const id of d.keys()) if (!ids.has(id)) local.deleted[`${col}:${id}`] = Math.max(local.deleted[`${col}:${id}`] || 0, 1);
+  }
+  const ds = def.settings || {};
+  for (const [k, v] of Object.entries(local.settings || {})) if (!same(ds[k], v) && !local.meta[`s:${k}`]) local.meta[`s:${k}`] = 1;
+  for (const k of Object.keys(local.rules || {})) if (!local.meta[`r:${k}`]) local.meta[`r:${k}`] = 1;
+  return local;
+}
+
+// Sin datos propios: igual que de fábrica y sin movimientos
+function isPristine(st, def) {
+  const bare = x => ({ a: (x.accounts || []).map(stripU), c: (x.categories || []).map(stripU), d: (x.debts || []).map(stripU), t: (x.tx || []).length, r: x.rules || {} });
+  return same(bare(st), bare(def));
+}
+
+// Junta dos estados. Por registro gana el cambio más reciente (empate: la nube, así todos convergen igual).
+// Orden: el de la nube, y al final lo que solo existe aquí. Lo borrado queda borrado salvo que se haya
+// cambiado después, o que un movimiento vivo todavía lo use (cuentas y deudas).
 function mergeStates(local, remote) {
   const out = { ...remote, ...local };
   const dead = { ...(remote.deleted || {}) };
   for (const [k, at] of Object.entries(local.deleted || {})) dead[k] = Math.max(dead[k] || 0, at);
+  const lm = local.meta || {}, rm = remote.meta || {};
+  const meta = { ...rm };
+  for (const [k, v] of Object.entries(lm)) meta[k] = Math.max(meta[k] || 0, v);
+  const all = {};
   for (const col of SYNC_COLS) {
     const byId = new Map(), order = [];
-    for (const r of local[col] || []) { byId.set(r.id, r); order.push(r.id); }
-    for (const r of remote[col] || []) {
-      const l = byId.get(r.id);
-      if (!l) { byId.set(r.id, r); order.push(r.id); } else if ((r.u || 0) >= (l.u || 0)) byId.set(r.id, r);
+    for (const r of remote[col] || []) { byId.set(r.id, r); order.push(r.id); }
+    for (const r of local[col] || []) {
+      const x = byId.get(r.id);
+      if (!x) { byId.set(r.id, r); order.push(r.id); } else if ((r.u || 0) > (x.u || 0)) byId.set(r.id, r);
     }
-    out[col] = order.filter(id => !(dead[`${col}:${id}`] >= (byId.get(id).u || 0))).map(id => byId.get(id));
+    all[col] = { byId, order };
+  }
+  const isDead = (col, id) => dead[`${col}:${id}`] >= (all[col].byId.get(id).u || 0);
+  for (const id of all.tx.order) {
+    if (isDead('tx', id)) continue;
+    const t = all.tx.byId.get(id);
+    for (const [col, refs] of REFS) for (const ref of refs(t)) {
+      if (ref && all[col].byId.has(ref) && isDead(col, ref)) {
+        const k = `${col}:${ref}`;
+        all[col].byId.set(ref, { ...all[col].byId.get(ref), u: dead[k] + 1 }); // vuelve, marcado después del borrado
+        delete dead[k];
+      }
+    }
+  }
+  for (const col of SYNC_COLS) out[col] = all[col].order.filter(id => !isDead(col, id)).map(id => all[col].byId.get(id));
+  const ls = local.settings || {}, rs = remote.settings || {};
+  out.settings = {};
+  for (const k of new Set([...Object.keys(rs), ...Object.keys(ls)])) {
+    out.settings[k] = (lm[`s:${k}`] || 0) > (rm[`s:${k}`] || 0) ? (k in ls ? ls[k] : rs[k]) : (k in rs ? rs[k] : ls[k]);
+  }
+  const lr = local.rules || {}, rr = remote.rules || {};
+  out.rules = {};
+  for (const k of new Set([...Object.keys(rr), ...Object.keys(lr)])) {
+    const lu = lm[`r:${k}`] || 0, ru = rm[`r:${k}`] || 0;
+    const v = lu > ru ? (k in lr ? lr[k] : rr[k]) : (k in rr ? rr[k] : lr[k]);
+    if (!(dead[`rules:${k}`] >= Math.max(lu, ru))) out.rules[k] = v;
   }
   out.deleted = dead;
-  const lm = local.meta || {}, rm = remote.meta || {};
-  out.settings = (lm.settingsU || 0) > (rm.settingsU || 0) ? local.settings : remote.settings;
-  out.rules = (lm.rulesU || 0) > (rm.rulesU || 0) ? local.rules : remote.rules;
-  out.meta = { ...rm, ...lm, settingsU: Math.max(lm.settingsU || 0, rm.settingsU || 0), rulesU: Math.max(lm.rulesU || 0, rm.rulesU || 0) };
+  out.meta = meta;
   return out;
 }
 
@@ -145,29 +205,35 @@ async function ghPut(cfg, file, sha) {
 }
 
 // Una vuelta completa: leer la nube, juntar con lo local, subir si hace falta.
-// getLocal() se llama al principio; devuelve el estado unido y si hubo que subir algo.
-async function syncRound(cfg, getLocal, normalize = x => x) {
+// opts.normalize valida lo que llega; opts.canUpload(local) decide si un estado sin datos se sube;
+// opts.valid() se consulta antes de escribir (si el usuario desconectó a mitad, no se escribe nada).
+async function syncRound(cfg, getLocal, opts = {}) {
+  const normalize = opts.normalize || (x => x), canUpload = opts.canUpload || (() => true), valid = opts.valid || (() => true);
   for (let attempt = 0; attempt < 4; attempt++) {
     const remote = await ghGet(cfg);
     const local = getLocal();
     const remoteState = remote ? normalize(await openState(remote.file, cfg.pass)) : null;
     const merged = remoteState ? mergeStates(local, remoteState) : local;
-    const changed = !remoteState || JSON.stringify(merged) !== JSON.stringify(remoteState);
-    if (changed) {
-      try { await ghPut(cfg, await sealState(merged, cfg.pass, remote && remote.file.salt), remote && remote.sha); }
+    let uploaded = false;
+    if (remoteState ? !same(merged, remoteState) : canUpload(local)) {
+      if (!valid()) { const e = new Error('cancelado'); e.cancelled = true; throw e; }
+      try { await ghPut(cfg, await sealState(merged, cfg.pass, remote && remote.file.salt), remote && remote.sha); uploaded = true; }
       catch (e) { if (e.conflict && attempt < 3) continue; throw e; }
     }
-    return { merged, uploaded: changed };
+    return { merged, remoteState, uploaded };
   }
   throw new Error('No se pudo sincronizar: otro dispositivo estaba guardando al mismo tiempo. Reintenta.');
 }
 
-if (typeof module !== 'undefined') module.exports = { stampChanges, mergeStates, sealState, openState, ghGet, ghPut, ghCheckRepo, syncRound, toB64, fromB64 };
+if (typeof module !== 'undefined') module.exports = { stampChanges, mergeStates, baselineStamp, isPristine, sealState, openState, ghGet, ghPut, ghCheckRepo, syncRound, toB64, fromB64 };
 
 /* ---------- Interfaz y disparadores (usan app.js cuando se llaman) ---------- */
-const syncState = { busy: false, again: false, status: 'off', msg: '', pending: null };
+// gen cambia al conectar, desconectar o cambiar el código: una vuelta de otra «generación» se descarta
+const syncState = { busy: false, again: false, status: 'off', msg: '', pending: null, gen: 0, connecting: false };
 const readSyncCfg = () => { try { return JSON.parse(localStorage.getItem(SYNC_KEY)); } catch (e) { return null; } };
 const writeSyncCfg = cfg => { try { if (cfg) localStorage.setItem(SYNC_KEY, JSON.stringify(cfg)); else localStorage.removeItem(SYNC_KEY); } catch (e) { /* sin espacio */ } };
+const isOfflineError = e => e && e.name === 'TypeError'; // fetch sin red lanza TypeError («Load failed» en iOS)
+const friendly = e => (isOfflineError(e) ? 'Sin conexión a internet' : (e && e.message) || 'Error desconocido');
 
 function setSyncStatus(status, msg = '') {
   syncState.status = status; syncState.msg = msg;
@@ -180,7 +246,7 @@ function setSyncStatus(status, msg = '') {
 function syncChipHTML() {
   if (!readSyncCfg()) return '<span id="sync-chip"></span>';
   const s = syncState.status;
-  const [ico, t] = s === 'busy' ? ['⏳', 'Sincronizando…'] : s === 'ok' ? ['☁️', 'Sincronizado'] : s === 'offline' ? ['📴', 'Sin conexión: se sincroniza luego'] : s === 'error' ? ['⚠️', syncState.msg || 'Error al sincronizar'] : ['☁️', ''];
+  const [ico, t] = s === 'busy' ? ['⏳', 'Sincronizando…'] : s === 'ok' ? ['☁️', 'Sincronizado'] : s === 'offline' ? ['📴', 'Sin conexión: se sincroniza luego'] : s === 'error' ? ['⚠️', syncState.msg || 'Error al sincronizar'] : ['☁️', 'Sincronización'];
   return `<button id="sync-chip" class="sync-chip ${s}" data-tab-go="ajustes" title="${esc(t)}" aria-label="${esc(t)}">${ico}</button>`;
 }
 
@@ -200,8 +266,12 @@ function syncSectionHTML() {
       <p class="small" style="margin-top:0">Conectado a <b>${esc(cfg.owner)}/${esc(cfg.repo)}</b>. Cada cambio se cifra aquí y se sube; al abrir la app se traen los cambios del otro dispositivo.</p>
       ${syncStatusHTML()}
       <div class="actions"><button class="btn" data-act="sync-off">Desconectar</button><button class="btn primary" data-act="sync-now">Sincronizar ahora</button></div>
+      <details style="margin-top:12px"><summary class="small" style="color:var(--accent)">Cambiar el código de acceso (si venció)</summary>
+        <label class="field" style="margin-top:10px"><span>Código nuevo</span><input id="sy-newtoken" type="password" autocapitalize="off" autocorrect="off" autocomplete="off" placeholder="github_pat_…"></label>
+        <button class="btn block" data-act="sync-token">Guardar código nuevo</button></details>
     </div>`;
   }
+  const busy = syncState.connecting;
   return `<div class="card">
     <p class="small muted" style="margin-top:0">Guarda tus datos cifrados en un repositorio privado de GitHub para verlos en el iPhone y el iPad. Usa el mismo código y la misma contraseña en los dos.</p>
     <label class="field"><span>Usuario de GitHub</span><input id="sy-owner" autocapitalize="off" autocorrect="off" value="AARON23923273932"></label>
@@ -209,50 +279,60 @@ function syncSectionHTML() {
     <label class="field"><span>Código de acceso de GitHub (token)</span><input id="sy-token" type="password" autocapitalize="off" autocorrect="off" autocomplete="off" placeholder="github_pat_…"></label>
     <label class="field"><span>Contraseña para cifrar (mínimo 8 caracteres)</span><input id="sy-pass" type="password" autocomplete="new-password"></label>
     <label class="field"><span>Repite la contraseña</span><input id="sy-pass2" type="password" autocomplete="new-password"></label>
-    <p class="small muted">Si olvidas la contraseña, los datos de la nube no se pueden abrir (los de cada dispositivo siguen ahí).</p>
-    <button class="btn primary block" data-act="sync-connect">Conectar</button>
+    <p class="small muted">Si en este dispositivo ya tienes datos, se juntan con los de la nube (no se borra nada). Si olvidas la contraseña, lo de la nube no se puede abrir.</p>
+    <button class="btn primary block" data-act="sync-connect" ${busy ? 'disabled' : ''}>${busy ? 'Conectando…' : 'Conectar'}</button>
   </div>`;
 }
 
 // Clona lo local tal como está (con sus marcas `u`), para que la unión no mezcle objetos vivos
 const snapshotLocal = () => JSON.parse(JSON.stringify(S));
+// Lo que llega de la nube se valida igual que un respaldo importado
+const validateRemote = st => validateBackup(st);
 
-// Aplica un estado traído de la nube. Con una hoja abierta se espera a que se cierre
-// (sus formularios apuntan a los objetos actuales y se perdería lo que el usuario edita).
+// Aplica un estado unido. Con una hoja abierta se espera a que se cierre (sus formularios apuntan a
+// los objetos actuales y se perdería lo que se edita). Si no cambió nada, no se toca la pantalla.
 function applySynced(state) {
   if (!$('#sheet').hidden) { syncState.pending = state; return; }
-  const now = JSON.stringify(S);
-  const next = now === syncState.baseJson ? state : mergeStates(snapshotLocal(), state); // lo guardado durante la vuelta, encima
-  persistState(next);
+  const next = JSON.stringify(S) === syncState.baseJson ? state : mergeStates(snapshotLocal(), state); // lo guardado durante la vuelta, encima
   if (JSON.stringify(next) !== JSON.stringify(state)) syncState.again = true;
+  if (JSON.stringify(next) === JSON.stringify(S)) return;
+  persistState(next);
 }
 
 async function syncNow() {
   const cfg = readSyncCfg();
   if (!cfg) return;
   if (syncState.busy || !$('#sheet').hidden) { syncState.again = true; return; }
+  const gen = syncState.gen;
+  const current = () => gen === syncState.gen && !!readSyncCfg();
   syncState.busy = true; setSyncStatus('busy');
   try {
     syncState.baseJson = JSON.stringify(S);
-    const { merged } = await syncRound(cfg, snapshotLocal, s => normalizeState(s));
+    const { merged } = await syncRound(cfg, snapshotLocal, {
+      normalize: validateRemote, valid: current, canUpload: local => !isPristine(local, defaults()),
+    });
+    if (!current()) return; // desconectado o reconectado a mitad: no se aplica ni se escribe nada
     applySynced(normalizeState(merged));
-    writeSyncCfg({ ...cfg, lastSync: Date.now() });
+    const cur = readSyncCfg();
+    if (cur) writeSyncCfg({ ...cur, lastSync: Date.now() });
     setSyncStatus('ok');
   } catch (e) {
-    const offline = (typeof navigator !== 'undefined' && navigator.onLine === false) || e.name === 'TypeError';
-    setSyncStatus(offline ? 'offline' : 'error', e.message);
+    if (e.cancelled || !current()) return;
+    setSyncStatus(isOfflineError(e) ? 'offline' : 'error', friendly(e));
   } finally {
     syncState.busy = false;
-    if (syncState.again) { syncState.again = false; setTimeout(syncNow, 800); }
+    if (syncState.again && readSyncCfg()) { syncState.again = false; setTimeout(syncNow, 800); }
   }
 }
 
 let syncTimer = null;
-function scheduleSync() {
+function scheduleSync(delay = 1500) {
   if (!readSyncCfg()) return;
   clearTimeout(syncTimer);
-  syncTimer = setTimeout(syncNow, 1500);
+  syncTimer = setTimeout(() => { syncTimer = null; syncNow(); }, delay);
 }
+// Al irse de la app (bloquear, cambiar de app) lo pendiente se sube ya: iOS congela los temporizadores
+function flushSyncNow() { if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; syncNow(); } }
 
 // Al cerrar una hoja, aplicar lo que llegó de la nube mientras estaba abierta
 function flushPendingSync() {
@@ -261,45 +341,76 @@ function flushPendingSync() {
     persistState(mergeStates(snapshotLocal(), st));
     scheduleSync();
   } else if (syncState.again && !syncState.busy) {
-    // Se pidió sincronizar mientras la hoja estaba abierta: ahora sí
-    syncState.again = false; scheduleSync();
+    syncState.again = false; scheduleSync(); // se pidió sincronizar mientras la hoja estaba abierta
   }
 }
 
 async function syncConnect() {
+  if (syncState.connecting) return;
   const val = id => ($(`#${id}`)?.value || '').trim();
   const cfg = { owner: val('sy-owner'), repo: val('sy-repo'), path: 'datos.enc', token: val('sy-token'), pass: $('#sy-pass').value };
   if (!cfg.owner || !cfg.repo || !cfg.token) return toast('Falta usuario, repositorio o código');
   if (cfg.pass.length < 8) return toast('La contraseña debe tener al menos 8 caracteres');
   if (cfg.pass !== $('#sy-pass2').value) return toast('Las contraseñas no coinciden');
-  setSyncStatus('busy');
+  closeSheet();
+  syncState.connecting = true; render();
+  const keep = { owner: cfg.owner, repo: cfg.repo };
   try {
     await ghCheckRepo(cfg);
     const remote = await ghGet(cfg);
+    const def = defaults();
     if (remote) {
-      const remoteState = normalizeState(await openState(remote.file, cfg.pass));
-      const n = remoteState.tx.length, here = S.tx.length;
-      // Un dispositivo nuevo normalmente quiere lo de la nube tal cual; si también tiene datos, se juntan
-      if (confirm(`En la nube ya hay datos (${remoteState.accounts.length} cuentas, ${n} movimientos).\n\nAceptar: usar los de la nube en este dispositivo (se reemplazan los ${here} movimientos de aquí).\nCancelar: juntar los de la nube con los de aquí.`)) {
-        persistState(remoteState);
+      const remoteState = validateRemote(await openState(remote.file, cfg.pass));
+      if (isPristine(S, def)) {
+        persistState(remoteState); // dispositivo sin datos propios: toma lo de la nube tal cual
+      } else {
+        const n = remoteState.tx.length;
+        if (!confirm(`En la nube hay ${remoteState.accounts.length} cuentas y ${n} movimientos, y este dispositivo tiene ${S.tx.length} movimientos propios.\n\nSe van a JUNTAR: no se borra nada de ningún lado. ¿Continuar?\n\n(Si lo de aquí eran pruebas, cancela, usa «Borrar todos los datos» y vuelve a conectar.)`)) return;
+        const local = baselineStamp(snapshotLocal(), def);
+        persistState(mergeStates(local, remoteState));
       }
+    } else if (!isPristine(S, def)) {
+      persistState(baselineStamp(snapshotLocal(), def)); // primer dispositivo: sus datos de antes ganan a los de fábrica
     }
+    syncState.gen++;
     writeSyncCfg(cfg);
     toast('Conectado. Sincronizando…');
-    render();
     await syncNow();
   } catch (e) {
     setSyncStatus('off');
-    toast(e.message || 'No se pudo conectar');
+    toast(e.badPass ? 'La contraseña no coincide con la que usaste en el otro dispositivo' : friendly(e));
+  } finally {
+    syncState.connecting = false;
+    render();
+    Object.entries(keep).forEach(([k, v]) => { const el = $(`#sy-${k}`); if (el) el.value = v; });
   }
 }
 
+async function syncChangeToken() {
+  const cfg = readSyncCfg();
+  const token = ($('#sy-newtoken')?.value || '').trim();
+  if (!cfg || !token) return toast('Pega el código nuevo');
+  try {
+    await ghCheckRepo({ ...cfg, token });
+    syncState.gen++;
+    writeSyncCfg({ ...cfg, token });
+    toast('Código actualizado');
+    render();
+    syncNow();
+  } catch (e) { toast(friendly(e)); }
+}
+
 function syncDisconnect() {
-  if (!confirm('¿Desconectar este dispositivo? Tus datos se quedan aquí y en la nube; solo deja de sincronizar.')) return;
+  if (!confirm('¿Desconectar este dispositivo? Tus datos se quedan aquí y en la nube; solo deja de sincronizar. El código y la contraseña se borran de este dispositivo.')) return;
+  syncState.gen++;
+  clearTimeout(syncTimer); syncTimer = null;
   writeSyncCfg(null); setSyncStatus('off'); render();
 }
 
 if (typeof window !== 'undefined') {
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') scheduleSync(); });
-  window.addEventListener('online', scheduleSync);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') scheduleSync(); else flushSyncNow();
+  });
+  window.addEventListener('pagehide', flushSyncNow);
+  window.addEventListener('online', () => scheduleSync());
 }

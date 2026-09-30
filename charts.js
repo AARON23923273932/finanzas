@@ -302,7 +302,7 @@ function viewGraficos() {
   }
 
   const byCat = {};
-  all.forEach(t => { if (t.type === 'gasto' && t.date >= rangeStart) byCat[t.categoryId] = (byCat[t.categoryId] || 0) + t.amount; });
+  all.forEach(t => { if (t.type === 'gasto' && t.date >= rangeStart) byCat[catIdOf(t)] = (byCat[catIdOf(t)] || 0) + t.amount; });
   let cats = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
   if (cats.length > 7) cats = cats.slice(0, 6).concat([['__otras', cats.slice(6).reduce((a, c) => a + c[1], 0)]]);
   const catTotal = cats.reduce((a, c) => a + c[1], 0), catMax = cats[0]?.[1] || 1;
